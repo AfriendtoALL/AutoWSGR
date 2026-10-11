@@ -29,6 +29,12 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from autowsgr.combat import CombatResult
 from autowsgr.infra.logger import get_logger
+from autowsgr.scheduler.recovery import (
+    RecoveryOutcome,
+    RecoveryPolicy,
+    maybe_launch_emulator,
+    recover_device,
+)
 from autowsgr.types import ConditionFlag
 
 
@@ -183,6 +189,10 @@ class TaskScheduler:
     recovery_cooldown:
         两次重启游戏之间的最小间隔 (秒)。默认
         :data:`DEFAULT_RECOVERY_COOLDOWN` (60)。
+    auto_launch_emulator:
+        设备不可用时是否允许脚本**拉起模拟器实例**。默认 ``False``。
+        这是有副作用的操作 (占用内存/显存、可能与用户手动操作冲突),
+        因此必须显式开启。见 :mod:`autowsgr.scheduler.recovery` 的分级策略。
     """
 
     def __init__(
@@ -193,12 +203,14 @@ class TaskScheduler:
         idle_sleep: float = 5.0,
         max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
         recovery_cooldown: float = DEFAULT_RECOVERY_COOLDOWN,
+        auto_launch_emulator: bool = False,
     ) -> None:
         self._ctx = ctx
         self._expedition_interval = expedition_interval
         self._idle_sleep = idle_sleep
         self._max_consecutive_failures = max_consecutive_failures
         self._recovery_cooldown = recovery_cooldown
+        self._auto_launch_emulator = auto_launch_emulator
         self._tasks: list[FightTask] = []
         self._last_expedition_time: float = 0.0
         # 触发器调度 (auto_daily 长期挂机)
@@ -208,6 +220,7 @@ class TaskScheduler:
         # 故障恢复熔断状态
         self._consecutive_failures: int = 0
         self._last_restart_at: float = 0.0
+        self._recovery_policy = RecoveryPolicy(auto_launch_emulator=auto_launch_emulator)
 
     # ── 任务管理 ──
 
@@ -510,11 +523,22 @@ class TaskScheduler:
         results: list[CombatResult],
         crashed: bool,
     ) -> None:
-        """失败处置: 先轻量恢复回主页面, 连续失败达阈值才重启游戏。
+        """失败处置: 分层恢复 (页面 → 设备 → 游戏 → 模拟器)。
 
-        两级处置的原因: 绝大多数失败是**单轮偶发** (一次船坞处理失败、一次
+        两级判断的原因: 绝大多数失败是**单轮偶发** (一次船坞处理失败、一次
         页面抖动), 立即重启游戏代价太大; 而设备真掉线时会持续失败, 8~10 分钟
         内必然累积到阈值 (见 :data:`DEFAULT_MAX_CONSECUTIVE_FAILURES`)。
+
+        **先判设备再判游戏** (实机 2026-10-11 教训): 设备离线时
+        ``restart_game`` 必然失败 (adb 指令都发不出去), 此前把两者当同一
+        层处理, 导致模拟器关闭后进入高速死循环 —— 5 次「失败轮」在 0.1 秒内
+        跑完, 60 秒冷却期形同虚设, 8 分钟写出10MB 日志。
+
+        处置顺序 (副作用从小到大):
+
+        1. 设备正常 → 回主页面; 连续失败达阈值 → 重启游戏
+        2. 设备异常 → L2 重连 adb/视频流 (无副作用)
+        3. 仍不可用 → L3 拉起模拟器 (有副作用, 需 ``--auto-launch-emulator``)
         """
         flags = [r.flag.value if r.flag else 'N/A' for r in results]
         _log.warning(
@@ -528,17 +552,21 @@ class TaskScheduler:
             flags or '无结果',
         )
 
+        # ── 先判断设备是否可用 (决定走哪条恢复路径) ──
+        if not self._ensure_device_usable():
+            return
+
+        # ── 设备正常: 可能是游戏/页面层问题 ──
         if self._max_consecutive_failures <= 0:
-            # 熔断被禁用: 只做轻量恢复
             self._try_recover_to_main()
             return
 
         if self._consecutive_failures < self._max_consecutive_failures:
-            # 未达阈值 → 轻量恢复 (回主页面), 其失败不致命
             self._try_recover_to_main()
+            self._apply_failure_backoff()
             return
 
-        # 达阈值 → 熔断重启, 但受冷却期保护
+        # 达阈值 → 熔断重启游戏, 但受冷却期保护
         now = time.monotonic()
         if now - self._last_restart_at < self._recovery_cooldown:
             _log.error(
@@ -548,6 +576,8 @@ class TaskScheduler:
                 now - self._last_restart_at,
                 self._recovery_cooldown,
             )
+            # 冷却期内也要退避, 否则会高速空转
+            self._apply_failure_backoff()
             return
 
         _log.error(
@@ -559,6 +589,59 @@ class TaskScheduler:
         # 重启后重新计数, 让新连接有机会从干净状态跑起
         self._consecutive_failures = 0
         self._last_restart_at = now
+
+    def _apply_failure_backoff(self) -> None:
+        """失败轮之间退避。
+
+        修复前的致命问题: 设备不可用时截图瞬间抛异常, 5 次「失败轮」在
+        **0.1 秒内**跑完, 60 秒冷却期完全失效 → 高速死循环 (8 分钟 10MB
+        日志)。指数退避保证失败轮之间有真实等待。
+        """
+        delay = self._recovery_policy.backoff_seconds(self._consecutive_failures)
+        if delay > 0:
+            _log.info('[Scheduler] 失败退避 {:.1f}s', delay)
+            time.sleep(delay)
+
+    def _ensure_device_usable(self) -> bool:
+        """确保设备可用。返回 ``True`` 表示可以继续走游戏层恢复。
+
+        这是**设备与游戏的分水岭**: 返回 ``False`` 意味着连 adb 都不通,
+        此时任何「重启游戏」的尝试都必然失败, 必须在设备层解决。
+        """
+        try:
+            outcome = recover_device(self._ctx, self._recovery_policy)
+        except Exception as exc:  # noqa: BLE001 - 诊断本身不应打断主循环
+            _log.opt(exception=True).warning('[Scheduler] 设备诊断异常: {}', exc)
+            return True  # 诊断失败 ≠ 设备故障, 保守按原路径走
+
+        if outcome is RecoveryOutcome.RECOVERED:
+            self._consecutive_failures = 0
+            _log.info('[Scheduler] 设备已恢复, 继续执行')
+            return True
+
+        if outcome is RecoveryOutcome.NEEDS_GAME_RESTART:
+            return True
+
+        # 设备不可用 → 尝试 L3 拉起模拟器 (仅在显式允许时)
+        outcome = maybe_launch_emulator(self._ctx, self._recovery_policy)
+
+        if outcome is RecoveryOutcome.RECOVERED:
+            self._consecutive_failures = 0
+            return True
+        if outcome is RecoveryOutcome.NEEDS_GAME_RESTART:
+            return True
+
+        # 彻底无法恢复
+        _log.error(
+            '[Scheduler] 设备不可用且无法自动恢复 (auto_launch_emulator={}), '
+            '本轮放弃。不重启游戏 (adb 不通, 重启必然失败)。',
+            self._auto_launch_emulator,
+        )
+        self._consecutive_failures = 0
+        self._last_restart_at = time.monotonic()
+        # 退避: 设备长期不可用时不能高速空转
+        self._apply_failure_backoff()
+        return False
 
     def _try_recover_to_main(self) -> None:
         """轻量恢复: 回到主页面 (认不出页面时由被调方重启游戏)。

@@ -56,10 +56,18 @@ def _make_ctx() -> MagicMock:
 
 
 def _make_scheduler(**kwargs) -> TaskScheduler:
-    """构造调度器, 并把两个恢复动作替换为计数 mock。"""
+    """构造调度器, 并把两个恢复动作替换为计数 mock。
+
+    同时把失败退避的 sleep 打成 0 —— 调度器在失败时会指数退避
+    (5→10→20→40s), 不屏蔽的话单个用例就会真实等待 75秒。
+    退避逻辑本身由``testing/ops/test_device_recovery_unit.py::TestBackoff``
+    单独断言。
+    """
     sched = TaskScheduler(_make_ctx(), **kwargs)
     sched._try_recover_to_main = MagicMock()  # type: ignore[method-assign]
     sched._restart_game_safely = MagicMock()  # type: ignore[method-assign]
+    sched._recovery_policy.backoff_base = 0.0
+    sched._recovery_policy.backoff_max = 0.0
     return sched
 
 
@@ -242,7 +250,7 @@ class TestFailureCounterReset:
 
         若归零逻辑缺失, 后续失败会因累积而立即触发重启 (误重启正常游戏)。
         """
-        sched = _make_scheduler()
+        sched = _make_scheduler(idle_sleep=0.0)
         sched._ensure_main_page_clean = MagicMock()  # type: ignore[method-assign]
 
         outcomes: list[list[CombatResult]] = [
@@ -347,6 +355,7 @@ class TestRunTaskReturnContract:
     def test_returns_results_list(self) -> None:
         """正常执行时返回 runner 的结果列表。"""
         sched = TaskScheduler(_make_ctx())
+        sched._maybe_collect_expedition = MagicMock()  # type: ignore[method-assign]
         runner = MagicMock()
         runner.run.return_value = CombatResult(flag=ConditionFlag.OPERATION_SUCCESS)
         task = types.SimpleNamespace(
@@ -362,6 +371,7 @@ class TestRunTaskReturnContract:
     def test_returns_action_failed_on_exception(self) -> None:
         """runner 抛异常 → 返回 ACTION_FAILED (供上层计失败)。"""
         sched = TaskScheduler(_make_ctx())
+        sched._maybe_collect_expedition = MagicMock()  # type: ignore[method-assign]
         runner = MagicMock()
         runner.run.side_effect = RuntimeError('页面识别失败')
         task = types.SimpleNamespace(

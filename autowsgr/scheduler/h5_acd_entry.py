@@ -88,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RECOVERY_COOLDOWN,
         help='两次重启游戏之间的最小间隔 (秒)',
     )
+    ap.add_argument(
+        '--auto-launch-emulator',
+        action='store_true',
+        help=(
+            '设备不可用时允许脚本拉起模拟器实例 (默认关闭)。'
+            '注意: 该操作会占用内存/显存, 且模拟器可能是用户主动关闭的'
+        ),
+    )
     return ap
 
 
@@ -129,6 +137,7 @@ def run_forever(
     *,
     max_failures: int,
     recovery_cooldown: float,
+    auto_launch_emulator: bool = False,
 ) -> int:
     """无限挂机 (常驻调度器, 带故障熔断)。返回进程退出码。"""
     scheduler = TaskScheduler(
@@ -136,6 +145,7 @@ def run_forever(
         expedition_interval=0,  # 远征由触发器接管
         max_consecutive_failures=max_failures,
         recovery_cooldown=recovery_cooldown,
+        auto_launch_emulator=auto_launch_emulator,
     )
     build_daily_plan(scheduler, ctx)
     scheduler.run_daily()
@@ -160,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
             ctx,
             max_failures=args.max_failures,
             recovery_cooldown=args.recovery_cooldown,
+            auto_launch_emulator=args.auto_launch_emulator,
         )
 
     return run_once(ctx, times=args.times, fleet_id=args.fleet, plan_path=str(plan_path))
