@@ -6,7 +6,6 @@ import time
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from autowsgr.image_resources._lazy import load_template
 from autowsgr.infra.exceptions import ActionFailedError
 from autowsgr.vision import ROI, ImageChecker
 
@@ -18,12 +17,19 @@ if TYPE_CHECKING:
     from autowsgr.vision import ImageMatchDetail, ImageTemplate
 
 
+#: 活动答题浮层模板所属期号 (声明见 autowsgr/data/event/<期号>.yaml)。
+#: 2026-10-11 T2-3: 模板路径由数据文件提供, 不再硬编码在 Python 里。
+_QUIZ_EVENT = '20260930'
+
+
 @lru_cache(maxsize=1)
 def _quiz_templates() -> tuple[ImageTemplate, ImageTemplate]:
-    return (
-        load_template('event/quiz_prompt_20260930_540p.png', name='event_quiz_20260930'),
-        load_template('event/quiz_cancel_20260930_540p.png', name='event_quiz_cancel_20260930'),
-    )
+    from autowsgr.data.event_config import load_event_config
+
+    cfg = load_event_config(_QUIZ_EVENT)
+    prompt = cfg.templates('quiz_prompt')
+    cancel = cfg.templates('quiz_cancel')
+    return (prompt[0], cancel[0])
 
 
 def quiz_prompt_detail(screen: np.ndarray) -> ImageMatchDetail | None:

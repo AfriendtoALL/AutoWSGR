@@ -1,0 +1,14 @@
+# 活动期号配置 — 20260212
+#
+# 仅保留主页面入口图标 (720p 分辨率); 其模板尚未录入,故只声明已知的。
+# templates 支持**部分声明**: 缺 key 时调用方回退到旧硬编码路径。
+
+event_name: '20260212'
+
+# 未确认是否提供 α/β 入口; 缺省按支持处理 (与迁移前行为一致)。
+supports_entrance: true
+
+templates:
+  nav_icon:
+    - path: event/event_icon_20260212_720p.png
+      source_resolution: [1280, 720]

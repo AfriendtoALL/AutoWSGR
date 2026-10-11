@@ -21,7 +21,7 @@ from autowsgr.types import PageName
 from autowsgr.ui.event.event_page import (
     CLICK_BACK,
     CLICK_CLOSE_NODE_OVERLAY,
-    NODE_POSITIONS_BY_EVENT,
+    node_positions_for,
     BaseEventPage,
 )
 from autowsgr.vision import ImageMatchDetail
@@ -142,7 +142,9 @@ class TestEnterNode:
 
         page._enter_node(1)
 
-        x, y = NODE_POSITIONS_BY_EVENT['20260730'][1]
+        # 坐标来自活动期号配置 (autowsgr/data/event/<期号>.yaml),
+        # 2026-10-11 T2-3 参数化后不再有NODE_POSITIONS_BY_EVENT 常量。
+        x, y = node_positions_for(page._event_name)[1]
         ctrl.click.assert_called_once_with(x, y)
         assert ctrl.screenshot.call_count == 1
 
@@ -155,7 +157,88 @@ class TestEnterNode:
 
         with pytest.raises(ActionFailedError):
             page._enter_node(1)
-        assert ctrl.screenshot.call_count == 10
+
+
+# ─────────────────────────────────────────────
+# start_fight 的 α/β 入口校验 (2026-10-11 T2-3)
+# ─────────────────────────────────────────────
+
+
+class TestEntranceValidation:
+    """α/β 入口是否可用应由**活动配置**决定, 不再硬编码期号。
+
+    迁移前是 ``if self._event_name == '20260930' and entrance is not None``:
+    新活动上线时该判断恒为 False → 允许传入 α/β → 用错入口打偏节点,
+    且**没有任何报错**。
+    """
+
+    def _page(self, event_name: str) -> BaseEventPage:
+        return BaseEventPage(MagicMock(), event_name=event_name)
+
+    def test_entrance_rejected_for_current_event(self, monkeypatch) -> None:
+        """20260930 声明 supports_entrance: false → 传 entrance 必须报错。"""
+        page = self._page('20260930')
+        monkeypatch.setattr(BaseEventPage, '_dismiss_quiz', lambda _self: None)
+
+        with pytest.raises(ValueError, match='入口'):
+            page.start_fight('H5', 'alpha', skip_check=True)
+
+    def test_entrance_allowed_when_event_supports_it(self, monkeypatch) -> None:
+        """支持入口的活动 (20260730) → 不因 entrance 报错。"""
+        page = self._page('20260730')
+        monkeypatch.setattr(BaseEventPage, '_dismiss_quiz', lambda _self: None)
+        clicked: list[tuple] = []
+        monkeypatch.setattr(
+            page._ctrl, 'click', lambda x, y, **k: clicked.append((x, y))
+        )
+        monkeypatch.setattr(
+            'autowsgr.ui.event.event_page.click_and_wait_for_page',
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            page, '_fight_button_detail', lambda _s: None
+        )
+
+        reached: list[tuple] = []
+        monkeypatch.setattr(
+            'autowsgr.ui.event.event_page.click_and_wait_for_page',
+            lambda *a, **k: reached.append(k.get('click_coord')),
+        )
+
+        page.start_fight('H1', 'alpha', skip_check=True)
+
+        assert reached, '应走到出击点击 (未被入口校验拦截)'
+
+    def test_unknown_event_raises_instead_of_silently_allowing(
+        self, monkeypatch
+    ) -> None:
+        """期号无配置时**不能静默放行** (否则会误打节点)。
+
+        旧行为: 未知期号的判断恒为 False → 直接放行 → 用错入口打偏节点。
+        """
+        page = self._page('20991231')
+        monkeypatch.setattr(BaseEventPage, '_dismiss_quiz', lambda _self: None)
+
+        with pytest.raises(ValueError, match='无配置'):
+            page.start_fight('H1', 'alpha', skip_check=True)
+
+    def test_no_entrance_always_ok_for_configured_event(self, monkeypatch) -> None:
+        """不传 entrance 时不做入口校验 (本期活动用纯数字 map)。"""
+        page = self._page('20260930')
+        monkeypatch.setattr(BaseEventPage, '_dismiss_quiz', lambda _self: None)
+        monkeypatch.setattr(
+            page, '_fight_button_detail', lambda _s: None
+        )
+
+        reached: list[tuple] = []
+        monkeypatch.setattr(
+            'autowsgr.ui.event.event_page.click_and_wait_for_page',
+            lambda *a, **k: reached.append(k.get('click_coord')),
+        )
+
+        page.start_fight('H5', None, skip_check=True)
+
+        assert reached, '纯数字 map 应正常出击'
 
 
 # ─────────────────────────────────────────────

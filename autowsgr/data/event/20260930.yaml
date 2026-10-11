@@ -1,0 +1,51 @@
+# 活动期号配置 — 20260930「最强之舟」
+#
+# 用途: 承载所有**随活动期号变化**的数据 (模板路径/ 坐标布局 / 入口支持)。
+# 活动更迭时新增一个同名 .yaml 即可, 无需改动 Python 代码。
+#
+# 被谁读取:
+#   - ui/event/event_page.py   节点坐标、地图标题/出击模板、α/β 入口支持
+#   - ui/event/popups.py      问答弹窗模板
+#   - ui/main_page/event_nav.py  主页面活动入口图标
+#
+# 坐标约定: 归一化 0.0~1.0 相对坐标 (与全项目一致, 见 combat/actions.py Coords)。
+# 模板路径: 相对 autowsgr/data/images/, 必须含分辨率后缀。
+
+event_name: '20260930'
+title: '最强之舟'
+
+# 本期活动不提供 α/β 分入口。填true 则允许 plan 传 entrance。
+supports_entrance: false
+entrance_hint: '本期活动 map 请使用纯数字，不支持 α/β 入口'
+
+# 模板 (相对 autowsgr/data/images/)
+templates:
+  # 活动地图页标题 (识别是否处于活动地图)
+  title:
+    - path: event/event_title_20260930_540p.png
+      source_resolution: [960, 540]
+  # 地图页右下角出击按钮
+  fight_button:
+    - path: event/fight_button_20260930_540p.png
+      source_resolution: [960, 540]
+  # 主页面左侧活动入口图标
+  nav_icon:
+    - path: event/event_icon_20260930_540p.png
+      source_resolution: [960, 540]
+  # 活动内问答弹窗 (确认/取消)
+  quiz_prompt:
+    - path: event/quiz_prompt_20260930_540p.png
+      source_resolution: [960, 540]
+  quiz_cancel:
+    - path: event/quiz_cancel_20260930_540p.png
+      source_resolution: [960, 540]
+
+# 活动地图选择界面的地图入口坐标 (选 E1~E6 / H1~H6 中的哪张)。
+# 本期为不规则散点布局, 故覆盖默认的 NODE_POSITIONS 网格。
+node_positions:
+  '1': [0.0879801735, 0.2251655629]
+  '2': [0.5947955390, 0.2240618102]
+  '3': [0.7856257745, 0.2075055188]
+  '4': [0.1964064436, 0.5242825607]
+  '5': [0.4702602230, 0.6401766004]
+  '6': [0.7806691450, 0.7483443709]

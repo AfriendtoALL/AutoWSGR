@@ -57,13 +57,19 @@ def _get_fight_button_templates() -> list[ImageTemplate]:
     常直接落在此浮层态)。按钮是流程必按控件, 逐活动截一张 (与浮层整体外观
     相比, 按钮样式跨活动差异小), 且匹配位置 ``center`` 可直接用作点击坐标,
     布局微调也无需改坐标常量。
-    """
-    from autowsgr.image_resources._lazy import load_template
 
-    return [
-        load_template('event/fight_button_20260730_540p.png', name='fight_button'),
-        load_template('event/fight_button_20260930_540p.png', name='fight_button_20260930'),
-    ]
+    模板声明来自 ``autowsgr/data/event/<期号>.yaml`` 的 ``templates.fight_button``
+    (2026-10-11 T2-3 参数化), 按 :data:`DEFAULT_NAV_ORDER` 顺序合并。
+    """
+    from autowsgr.data.event_config import DEFAULT_NAV_ORDER, load_event_config
+
+    out: list[ImageTemplate] = []
+    for event_name in DEFAULT_NAV_ORDER:
+        cfg = load_event_config(event_name)
+        if not cfg.has_templates('fight_button'):
+            continue
+        out.extend(cfg.templates('fight_button'))
+    return out
 
 
 @lru_cache(maxsize=1)
@@ -74,21 +80,19 @@ def _get_event_title_templates() -> list[ImageTemplate]:
     标题图易获取 (从活动页截图裁标题即可), 且对不同活动深/浅色主题均鲁棒。
     匹配引擎按 ``source_resolution`` 自动缩放, 540p/720p 模板可共存;
     页面识别时 ``find_any`` 命中任一即认定为活动地图页面。
-    """
-    from autowsgr.image_resources._lazy import load_template
 
-    return [
-        load_template(
-            'event/event_title_20260930_540p.png',
-            name='event_title_20260930',
-            source_resolution=(960, 540),
-        ),
-        load_template(
-            'event/event_title_20260730_540p.png',
-            name='event_title_20260730',
-            source_resolution=(960, 540),
-        ),
-    ]
+    模板声明来自 ``autowsgr/data/event/<期号>.yaml`` 的 ``templates.title``
+    (2026-10-11 T2-3 参数化)。
+    """
+    from autowsgr.data.event_config import DEFAULT_NAV_ORDER, load_event_config
+
+    out: list[ImageTemplate] = []
+    for event_name in DEFAULT_NAV_ORDER:
+        cfg = load_event_config(event_name)
+        if not cfg.has_templates('title'):
+            continue
+        out.extend(cfg.templates('title'))
+    return out
 
 
 # ── 难度切换按钮图标模板 (延迟加载) ──────────────────────────────────────
@@ -141,26 +145,31 @@ NODE_POSITIONS = {
 缺省布局适用于多数活动; 布局不同的活动在 :data:`NODE_POSITIONS_BY_EVENT` 覆盖。
 """
 
-# 各活动专属地图入口坐标 (照搬 classic 各活动子类的 NODE_POSITION)
-# 激斗漩涡 (20260730): 3 行 2 列布局
-NODE_POSITIONS_BY_EVENT: dict[str, dict[int, tuple[float, float]]] = {
-    '20260930': {
-        1: (0.0879801735, 0.2251655629),
-        2: (0.5947955390, 0.2240618102),
-        3: (0.7856257745, 0.2075055188),
-        4: (0.1964064436, 0.5242825607),
-        5: (0.4702602230, 0.6401766004),
-        6: (0.7806691450, 0.7483443709),
-    },
-    '20260730': {
-        1: (0.1771, 0.3148),
-        2: (0.1740, 0.7259),
-        3: (0.5010, 0.2981),
-        4: (0.4906, 0.7463),
-        5: (0.8135, 0.2944),
-        6: (0.8125, 0.7463),
-    },
-}
+# 各活动专属地图入口坐标。
+# 数据已外置到 autowsgr/data/event/<期号>.yaml 的 node_positions
+# (2026-10-11 T2-3 参数化): 活动更迭时只加数据文件, 不改代码。
+# 迁移前的硬编码见 git 历史 (20260930 不规则散点 / 20260730 3行2列)。
+NODE_POSITIONS_BY_EVENT: dict[str, dict[int, tuple[float, float]]] = {}
+
+
+def node_positions_for(event_name: str) -> dict[int, tuple[float, float]]:
+    """取某活动期的地图入口坐标。
+
+    优先读 ``autowsgr/data/event/<期号>.yaml``; 未配置时回退到
+    :data:`NODE_POSITIONS` 的通用网格 (多数活动适用)。
+    """
+    from autowsgr.data.event_config import EventConfigError, load_event_config
+
+    try:
+        positions = load_event_config(event_name).node_positions
+    except EventConfigError as exc:
+        _log.warning(
+            '[EventPage] 活动 {} 无配置 ({}), 回退通用网格 NODE_POSITIONS',
+            event_name,
+            exc,
+        )
+        positions = {}
+    return positions or dict(NODE_POSITIONS)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 坐标常量
@@ -292,7 +301,7 @@ class BaseEventPage:
         node_id:
             节点编号, 通常为 1~6。
         """
-        positions = NODE_POSITIONS_BY_EVENT.get(self._event_name, NODE_POSITIONS)
+        positions = node_positions_for(self._event_name)
         x, y = positions[node_id]
         _log.debug('[UI] 活动地图: 选择节点 {}', node_id)
         self._ctrl.click(x, y)
@@ -311,9 +320,23 @@ class BaseEventPage:
         self, map: str, entrance: Literal['alpha', 'beta'] | None = None, skip_check: bool = False
     ) -> None:
         """点击出击按钮，等待进入出征准备页面。"""
-        # 本期地图无 α/β 标记，禁止误用上期入口配置。
-        if self._event_name == '20260930' and entrance is not None:
-            raise ValueError('20260930 活动 map 请使用纯数字，不支持 α/β 入口')
+        # α/β 入口支持情况随活动而异, 由期号配置声明
+        # (autowsgr/data/event/<期号>.yaml 的 supports_entrance)。
+        # 迁移前此处硬编码 `if self._event_name == '20260930'`, 新活动无法判断。
+        if entrance is not None:
+            from autowsgr.data.event_config import EventConfigError, load_event_config
+
+            try:
+                cfg = load_event_config(self._event_name)
+            except EventConfigError as exc:
+                # 缺配置不能静默放行 (否则会用错入口打偏节点)
+                raise ValueError(
+                    f'活动 {self._event_name} 无配置, 无法校验 α/β 入口: {exc}'
+                ) from exc
+            if not cfg.supports_entrance:
+                raise ValueError(
+                    f'活动 {self._event_name}: {cfg.entrance_hint}'
+                )
         # map 为 H1, E1 等
         self._dismiss_quiz()
         from autowsgr.ui.battle.preparation import BattlePreparationPage
@@ -323,7 +346,7 @@ class BaseEventPage:
                 len(map) != 2
                 or map[0] not in ('H', 'E')
                 or not map[1].isdigit()
-                or int(map[1]) not in NODE_POSITIONS
+                or int(map[1]) not in node_positions_for(self._event_name)
             ):
                 raise ValueError(f'无效的地图标识: {map}')
             if entrance not in ('alpha', 'beta', None):

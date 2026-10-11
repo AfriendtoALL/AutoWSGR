@@ -1,0 +1,28 @@
+# 活动期号配置 — 20260730「激斗漩涡」
+#
+# 3 行 2 列布局的地图入口坐标(照搬 classic even20260730, 已实机验证)。
+
+event_name: '20260730'
+title: '激斗漩涡'
+
+supports_entrance: true
+
+templates:
+  title:
+    - path: event/event_title_20260730_540p.png
+      source_resolution: [960, 540]
+  fight_button:
+    - path: event/fight_button_20260730_540p.png
+      source_resolution: [960, 540]
+  nav_icon:
+    - path: event/event_icon_20260730_540p.png
+      source_resolution: [960, 540]
+
+# 3 行 2 列布局
+node_positions:
+  '1': [0.1771, 0.3148]
+  '2': [0.1740, 0.7259]
+  '3': [0.5010, 0.2981]
+  '4': [0.4906, 0.7463]
+  '5': [0.8135, 0.2944]
+  '6': [0.8125, 0.7463]

@@ -38,26 +38,20 @@ def _get_event_icon_templates() -> list[ImageTemplate]:
     匹配引擎按 ``source_resolution`` 自动缩放以适配当前截图分辨率,
     故 540p/720p 采集的模板可共存。导航时 ``find_any`` 命中任一即视为
     检测到活动入口。
-    """
-    from autowsgr.image_resources._lazy import load_template
 
-    return [
-        load_template(
-            'event/event_icon_20260930_540p.png',
-            name='event_icon_20260930',
-            source_resolution=(960, 540),
-        ),
-        load_template(
-            'event/event_icon_20260212_720p.png',
-            name='event_icon_20260212',
-            source_resolution=(1280, 720),
-        ),
-        load_template(
-            'event/event_icon_20260730_540p.png',
-            name='event_icon_20260730',
-            source_resolution=(960, 540),
-        ),
-    ]
+    图标声明来自 ``autowsgr/data/event/<期号>.yaml`` 的 ``templates.nav_icon``,
+    按 :data:`~autowsgr.data.event_config.DEFAULT_NAV_ORDER` 顺序合并
+    (2026-10-11 T2-3 参数化) —— 新增活动只需加一个 YAML 文件。
+    """
+    from autowsgr.data.event_config import DEFAULT_NAV_ORDER, load_event_config
+
+    out: list[ImageTemplate] = []
+    for event_name in DEFAULT_NAV_ORDER:
+        cfg = load_event_config(event_name)
+        if not cfg.has_templates('nav_icon'):
+            continue
+        out.extend(cfg.templates('nav_icon'))
+    return out
 
 
 # ── 内部: 单次导航尝试 ──────────────────────────────────────────────────
