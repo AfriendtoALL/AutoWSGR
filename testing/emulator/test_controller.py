@@ -86,11 +86,13 @@ class TestScrcpyControllerCoordinates:
 class TestScrcpyControllerControlFlow:
     """测试 click/swipe/long_tap/key_event/text 的控制流编排。
 
-    在 _inject_touch / _inject_keycode / _inject_text / _set_clipboard 边界上
-    断言控制器发出了语义正确的动作序列、坐标与文本路由，而不关心底层字节如何打包。
+    触控 (click/swipe/long_tap) 走 adb ``input`` 命令 (MuMu 内置 scrcpy 服务
+    不支持 INJECT_TOUCH_EVENT，见 scrcpy.py 触控段注释)，在 ``_adb_input`` 边界
+    上断言语义正确的命令与像素坐标；按键/文本仍走 scrcpy 控制流，在
+    ``_inject_keycode`` / ``_inject_text`` / ``_set_clipboard`` 边界上断言，
+    而不关心底层字节如何打包。
 
     动作码取自 Android 官方定义（不导入实现侧常量，从而能捕获实现侧常量写错的 bug）：
-    - MotionEvent: ACTION_DOWN=0, ACTION_UP=1, ACTION_MOVE=2
     - KeyEvent:    ACTION_DOWN=0, ACTION_UP=1
     """
 
@@ -101,26 +103,19 @@ class TestScrcpyControllerControlFlow:
         c._device = MagicMock()
         return c
 
-    def test_click_down_then_up(self, ctrl: ScrcpyController):
-        """click = 同一点先 DOWN(pressure=1) 后 UP(pressure=0)。"""
-        ctrl._inject_touch = MagicMock()
+    def test_click_sends_adb_tap(self, ctrl: ScrcpyController):
+        """click = adb input tap，坐标换算为设备像素。"""
+        ctrl._adb_input = MagicMock()
         ctrl.click(0.5, 0.5, delay=False)
-        assert ctrl._inject_touch.call_args_list == [
-            call(0, 0.5, 0.5, pressure=1.0),  # ACTION_DOWN
-            call(1, 0.5, 0.5, pressure=0.0),  # ACTION_UP
-        ]
+        ctrl._adb_input.assert_called_once_with(['tap', '480', '270'])
 
-    def test_swipe_down_moves_up(self, ctrl: ScrcpyController):
-        """swipe = DOWN → 若干 MOVE → UP，首末坐标落在两端点。"""
-        ctrl._inject_touch = MagicMock()
+    def test_swipe_sends_adb_swipe(self, ctrl: ScrcpyController):
+        """swipe = adb input swipe，两端点像素坐标 + 毫秒时长。"""
+        ctrl._adb_input = MagicMock()
         ctrl.swipe(0.1, 0.2, 0.9, 0.8, duration=0.1, delay=False)
-        calls = ctrl._inject_touch.call_args_list
-        actions = [c.args[0] for c in calls]
-        assert actions[0] == 0  # DOWN
-        assert actions[-1] == 1  # UP
-        assert 2 in actions[1:-1]  # 中间至少一个 MOVE
-        assert calls[0].args[1:3] == (0.1, 0.2)  # 起点
-        assert calls[-1].args[1:3] == (0.9, 0.8)  # 终点
+        ctrl._adb_input.assert_called_once_with(
+            ['swipe', '96', '108', '864', '432', '100']
+        )
 
     def test_scroll_routes_fractional_delta_to_protocol_injector(
         self,
@@ -132,13 +127,13 @@ class TestScrcpyControllerControlFlow:
 
         ctrl._inject_scroll.assert_called_once_with(0.5, 0.6, horizontal=0.0, vertical=-0.25)
 
-    def test_long_tap_down_then_up_same_point(self, ctrl: ScrcpyController):
-        """long_tap = 同一点 DOWN → 保持 → UP。"""
-        ctrl._inject_touch = MagicMock()
+    def test_long_tap_sends_same_point_adb_swipe(self, ctrl: ScrcpyController):
+        """long_tap = adb input swipe 同点等时长 (系统保持按压)。"""
+        ctrl._adb_input = MagicMock()
         ctrl.long_tap(0.5, 0.5, duration=0.01)
-        calls = ctrl._inject_touch.call_args_list
-        assert len(calls) == 2
-        assert calls[0].args[1:3] == calls[1].args[1:3] == (0.5, 0.5)
+        ctrl._adb_input.assert_called_once_with(
+            ['swipe', '480', '270', '480', '270', '10']
+        )
 
     def test_key_event_down_then_up(self, ctrl: ScrcpyController):
         """key_event = 同一 keycode 先 DOWN 后 UP。"""

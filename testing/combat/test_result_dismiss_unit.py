@@ -164,20 +164,28 @@ class TestHandleResultModes:
 
     @pytest.fixture(autouse=True)
     def _stub_detectors(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(handlers_mod, 'detect_ship_stats', lambda *_a: _a[1])
         monkeypatch.setattr(handlers_mod, 'detect_result_grade', lambda *_a, **_k: 'S')
         monkeypatch.setattr(handlers_mod, 'detect_mvp', lambda *_a, **_k: '鲃鱼')
 
-    def test_fast_passes_through_exp(self):
-        """快速: 不采集评级/MVP, 不记录战果事件, 经验页穿行 (pass_through)。"""
+    def test_fast_blind_skips_settlement(self):
+        """快速: 不采集评级/MVP, 不记录战果事件; 结算三层由盲点穿行点过
+        (_blind_skip_settlement), 命中落点 (PROCEED) 即停。"""
         host, device, _ = _make_host(
-            [CombatPhase.EXP_SETTLEMENT, CombatPhase.PROCEED],
+            [None, CombatPhase.PROCEED],
             collect_result_info=False,
         )
         host._handle_result()
-        # 经验页命中后继续点击, 直到 PROCEED 才停 → 2 次点击
+        # 首击遇渐变帧继续, 次击命中 PROCEED 停止 → 2 次点击
         assert device.click.call_count == 2
         host._history.add.assert_not_called()
+
+    def test_fast_blind_skip_uses_safe_spot(self):
+        """快速穿行点击结算安全位 (SETTLE_SKIP), 避开 y≈0.648 按钮排。"""
+        from autowsgr.combat.actions import Coords
+
+        host, device, _ = _make_host([CombatPhase.PROCEED], collect_result_info=False)
+        host._handle_result()
+        assert device.click.call_args == call(*Coords.SETTLE_SKIP, delay=False)
 
     def test_slow_collects_grade_mvp_and_records(self):
         """慢速: 采集评级/MVP 记入战斗历史, 经验页是到达点 (只点一次)。"""

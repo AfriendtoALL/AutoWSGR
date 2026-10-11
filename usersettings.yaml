@@ -1,151 +1,33 @@
-# AutoWSGR v2 — 全量配置参考
-# ==========================================
-# 以下列出所有可配置项及其默认值。
-# 实际使用时只需保留需要修改的项, 其余删除即可自动取默认值。
-#
-# 配置查找顺序:
-#   1. launch("path/to/config.yaml")  — 显式指定
-#   2. 当前工作目录下的 usersettings.yaml  — 自动检测
+# AutoWSGR v2 — 最小可用配置（按需删改，未列出的项用内置默认值）
+# 配置查找顺序：
+#   1. launch("path/to/config.yaml")  显式指定
+#   2. 当前工作目录下的 usersettings.yaml  自动检测
 #   3. 无配置文件时使用内置默认值
 
-# ═══════════════════════════════════════════
-# 模拟器配置
-# ═══════════════════════════════════════════
+# ── 模拟器 ──
 emulator:
-  type: MuMu                       # 雷电 / 蓝叠 / MuMu / 夜神 / 逍遥 / WAYDROID
-  path: null                       # 模拟器可执行文件路径; null = 自动检测
-  serial: null                     # ADB serial 地址; null = 自动检测
-  process_name: null               # 模拟器进程名; null = 自动推断
+  type: MuMu                    # 雷电 / 蓝叠 / MuMu / 夜神 / 逍遥 / WAYDROID
+  serial: "127.0.0.1:16416"     # 多开时手动指定 ADB serial，默认自动检测
 
-# ═══════════════════════════════════════════
-# 游戏账号
-# ═══════════════════════════════════════════
+# ── 账号 ──
 account:
-  game_app: 官服                   # 官服 / 小米服 / 应用宝服
+  game_app: 官服                  # 官服 / 小米服 / 应用宝服
 
-# ═══════════════════════════════════════════
-# OCR 引擎
-# ═══════════════════════════════════════════
+# ── OCR 引擎（首次运行会自动下载模型，可保持默认）──
 ocr:
-  gpu: false                       # 是否使用 GPU 加速
-  mirror: modelscope               # Easyocr 模型镜像, 用于下载模型, 可选值如下
-  # origin: 使用Easyocr原生下载
-  # github: 使用Github地址下载, 由官方提供
-  # tencent: 使用kuai提供的镜像下载, 由腾讯云托管
-  # modelscope: 使用Ceceliachenen提供的镜像下载, 由ModelScope托管
-  ship_name_match_confidence: 0.65 # 舰名匹配置信度, 越大越严格, 建议勿改
-  ship_name_corrections: {}        # OCR误识别文字 -> SHIPNAMES标准舰名
-  # ship_name_corrections:
-  #   "OCR误识别文字": "标准舰名"
-  #   “巧心”: “热心”
-  ship_name_aliases:               # 用户自定义名 -> SHIPNAMES标准舰名
-    希尔德布兰德: AIII
-    契卡洛夫: 85工程
-    U-47·狼群: U-47
-    巴尔的摩·英魂: 巴尔的摩
+  gpu: false
+  mirror: modelscope             # 模型下载镜像：origin / github / tencent / modelscope
 
-# ═══════════════════════════════════════════
-# 日志
-# ═══════════════════════════════════════════
+# ── 日志 ──
 log:
-  level: DEBUG                     # DEBUG / INFO / WARNING / ERROR / CRITICAL
-  root: logs                       # 日志保存根目录
-  # dir: null                      # 日志保存路径; null = 自动按日期生成
+  level: DEBUG                    # DEBUG / INFO / WARNING / ERROR
 
-  # 细粒度显示开关
-  show_decisive_battle_info: true
-  show_emulator_debug: false        # 是否输出 emulator 通道 DEBUG (click/swipe 等操作)
-  show_ui_debug: false              # 是否输出 ui 通道 DEBUG (页面识别/等待轮询)
-  show_vision_debug: false          # 是否输出 vision 通道 DEBUG (模板匹配规则结果)
-  show_ops_debug: false             # 是否输出 ops 通道 DEBUG (页面导航/操作重试)
-  show_combat_state_debug: false    # 是否输出战斗状态机转移 DEBUG (当前状态→候选列表)
-  show_combat_recognition_debug: false  # 是否输出战斗识别 DEBUG (匹配状态/DLL返回/敌方编成)
-
-  # 通道级别覆盖 (键=通道名前缀, 值=级别; 优先级高于上方布尔开关)
-  # channels:
-  #   vision.pixel: TRACE
-  #   emulator: INFO
-
-# ═══════════════════════════════════════════
-# 脚本行为
-# ═══════════════════════════════════════════
-operation_delay_min: 0.0           # 单次操作最小延迟
-operation_delay_max: 0.0           # 单次操作最大延迟
-dock_full_destroy: true            # 船坞满时自动清空
-repair_manually: false             # 是否手动修理
-bathroom_count: 2                  # 浴室修理槽位数 (auto_bath_repair 空位调度用)
-
-# ── 解装设置 ──
-destroy_ship_work_mode: 不启用     # 不启用 / 黑名单 / 白名单
-# 不启用: 解装所有舰船
-# 黑名单: 解装列表中的舰种
-# 白名单: 解装不在列表中的舰种
-destroy_ship_types: []             # 指定舰种列表, 参照 ShipType 枚举使用中文
-  # - 航母
-  # - 潜艇
-remove_equipment_mode: true        # 拆解时默认卸下装备
-
-# ── 数据路径 ──
-plan_root: null                    # 自定义计划根目录; 下置 normal_fight/<plan>.yaml, 同名优先于包内默认
-
-# ═══════════════════════════════════════════
-# 日常自动化 (不需要可删除整个 daily_automation 块)
-# ═══════════════════════════════════════════
+# ── 日常自动化 ──
 daily_automation:
-  # 基础日常
-  auto_expedition: true            # 自动重复远征
-  auto_gain_bonus: true            # 任务完成时自动点击
-  auto_bath_repair: true           # 空闲时自动澡堂修理
-  bath_repair_blacklist:           # 不修理的舰船名 (auto_bath_repair 黑名单)
-    - 昆西
-    - 玛丽亚皇后
-  auto_set_support: false          # 自动开启战役支援
-
-  # 战役
-  auto_battle: true                # 自动打完每日战役次数
-  battle_type: 困难潜艇            # 战役类型, 可选值见下方说明
-  # 可选值: 简单航母 / 简单潜艇 / 简单驱逐 / 简单巡洋 / 简单战列
-  #         困难航母 / 困难潜艇 / 困难驱逐 / 困难巡洋 / 困难战列
-
-  # 演习
-  auto_exercise: true              # 自动打完每日三次演习
-  exercise_fleet_id: null          # 演习出征舰队 (null = 默认)
-
-  # 常规战
-  auto_normal_fight: true          # 按自定义任务进行常规战
-  normal_fight_tasks: []           # 常规战任务列表
-    # - task1.yaml
-    # - task2.yaml
-  quick_repair_limit: null         # 快修消耗上限; null = 无上限
-  stop_max_ship: false             # 获取当天上限 500 船后终止
-  stop_max_loot: false             # 获取当天上限 50 胖次后终止
-
-# ═══════════════════════════════════════════
-# 决战 (不需要可删除整个 decisive_battle 块)
-# 提示：决战舰队不要选择名字会滚动的舰船，否则容易导致识别错误
-# ═══════════════════════════════════════════
-decisive_battle:
-  chapter: 1                       # 决战章节 (1-6)
-  decisive_rounds: 1              # 决战连续执行轮数
-  level1:                          # 一级舰队
-    - 青波鱼
-    - U-1206
-    - U-47
-    - 射水鱼
-    - U-96
-    - 鹦鹉螺
-  level2:                          # 二级舰队
-    - U-1405
-    - M-296
-    - 伊-25
-    - "351"
-  flagship_priority:               # 旗舰优先级队列
-    - U-1405
-    - U-47
-    - U-96
-    - U-1206
-  repair_level: 2                  # 维修策略 (1=中破修, 2=大破修)
-  use_quick_repair: true           # 是否启用快修（桶修），关闭后不修理受损舰船。
-  full_destroy: false              # 船舱满了是否解装舰船
-  useful_skill: false              # 充分利用技能
-  useful_skill_strict: false       # 严格利用技能 (useful_skill 为 true 时才生效)
+  auto_battle: true
+  battle_type: 困难潜艇
+  auto_exercise: true
+  exercise_fleet_id: 2
+  auto_expedition: true
+  auto_gain_bonus: true
+  auto_bath_repair: true

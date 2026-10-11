@@ -34,16 +34,16 @@ from autowsgr.types import ConditionFlag
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 """项目根目录 (本文件位于 ``<root>/autowsgr/scheduler/``)。"""
 
-DEFAULT_PLAN = PROJECT_ROOT / 'plans' / 'H5-ACD.yaml'
+DEFAULT_PLAN = PROJECT_ROOT / 'autowsgr' / 'data' / 'plan' / 'event' / 'H5ACD夜战.yaml'
 """默认作战计划。
 
-项目内另有一份用途相同的计划
-``autowsgr/data/plan/event/H5ACD夜战.yaml`` (供 ``examples/run_h5acd.py``
-使用)。两者曾分叉 (那份用 formation: 4 梯形阵且缺 ``fight_condition``),
-用户 2026-10-11 确认统一为**单纵阵** 后已统一。
+计划文件统一放在包内 ``autowsgr/data/plan/event/`` (随包分发, 不依赖
+项目根的 ``plans/`` 目录)。历史上项目根 ``plans/H5-ACD.yaml`` 与本文件
+是同一用途的两份配置且长期分叉 (那份 formation: 4 梯形阵且缺
+``fight_condition``), 用户 2026-10-11 确认统一为单纵阵, 根目录那份已删除。
 
-一致性由 ``testing/combat/test_plan_consistency.py`` 锁定 —— 改动其中
-一份时必须同步另一份, 否则测试会失败。
+阵型/战况等关键配置由 ``testing/combat/test_plan_consistency.py`` 断言
+(显式校验为单纵阵)。
 """
 
 DEFAULT_SETTINGS = PROJECT_ROOT / 'usersettings.yaml'

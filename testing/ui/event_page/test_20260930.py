@@ -120,7 +120,6 @@ def test_start_fight_uses_0930_layout_and_button(
     ctx = MagicMock()
     ctx.ctrl.screenshot.return_value = _screen('fight_button')
     page = BaseEventPage(ctx, event_name='20260930')
-    monkeypatch.setattr(page, 'ensure_no_overlay', lambda: None)
     difficulty = MagicMock()
     monkeypatch.setattr(page, '_change_difficulty', difficulty)
     wait = MagicMock()

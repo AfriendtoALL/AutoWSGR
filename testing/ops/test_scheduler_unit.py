@@ -339,7 +339,7 @@ def test_starvation_not_warned_when_times_set():
 
 
 def test_starvation_not_warned_when_stop_limit_enabled():
-    """开启任一停止上限 → 常规战终会耗尽让位, 不告警。"""
+    """开启任一停止上限 (quick_repair_limit) → 常规战终会耗尽让位, 不告警。"""
     from autowsgr.infra.config import DailyAutomationConfig
     from autowsgr.scheduler.daily_plan import _bath_repair_starved_by_normal_fight
 
@@ -347,7 +347,7 @@ def test_starvation_not_warned_when_stop_limit_enabled():
         auto_bath_repair=True,
         auto_normal_fight=True,
         normal_fight_tasks=[{'name': 'x'}],
-        stop_max_ship=True,
+        quick_repair_limit=10,
     )
     assert _bath_repair_starved_by_normal_fight(cfg) is False
 
@@ -369,7 +369,12 @@ def test_starvation_not_warned_when_bath_repair_off():
 
 
 class _FakeDA:
-    """daily_automation 替身: 仅暴露 stop_max_ship / stop_max_loot。"""
+    """daily_automation 替身 (占位)。
+
+    .. note::
+        重构后 ``_sync_initial_counts`` 为空操作, 不再读取 stop_max_ship /
+        stop_max_loot, 此处字段仅供上下文占位。
+    """
 
     def __init__(self, stop_max_ship: bool = False, stop_max_loot: bool = False) -> None:
         self.stop_max_ship = stop_max_ship
@@ -393,26 +398,26 @@ def test_sync_initial_counts_skipped_when_no_stop_limit():
     assert called == []
 
 
-def test_sync_initial_counts_runs_when_stop_max_ship():
-    """启用 stop_max_ship → 调 ctx.sync_daily_drop_counts 校准。"""
+def test_sync_initial_counts_is_noop_when_stop_max_ship():
+    """重构后 _sync_initial_counts 为空操作, 不调用 ctx.sync_daily_drop_counts。"""
     ctx = _ctx_with_da(_FakeDA(stop_max_ship=True))
     called: list = []
     ctx.sync_daily_drop_counts = lambda: called.append(1)  # type: ignore[method-assign]
 
     sched = TaskScheduler(ctx, expedition_interval=0)  # type: ignore[arg-type]
     sched._sync_initial_counts()
-    assert called == [1]
+    assert called == []
 
 
-def test_sync_initial_counts_runs_when_stop_max_loot():
-    """启用 stop_max_loot (未启用 ship) → 仍校准。"""
+def test_sync_initial_counts_is_noop_when_stop_max_loot():
+    """重构后 _sync_initial_counts 为空操作, 不调用 ctx.sync_daily_drop_counts。"""
     ctx = _ctx_with_da(_FakeDA(stop_max_loot=True))
     called: list = []
     ctx.sync_daily_drop_counts = lambda: called.append(1)  # type: ignore[method-assign]
 
     sched = TaskScheduler(ctx, expedition_interval=0)  # type: ignore[arg-type]
     sched._sync_initial_counts()
-    assert called == [1]
+    assert called == []
 
 
 def test_sync_initial_counts_skipped_when_da_none():
@@ -424,27 +429,6 @@ def test_sync_initial_counts_skipped_when_da_none():
     sched = TaskScheduler(ctx, expedition_interval=0)  # type: ignore[arg-type]
     sched._sync_initial_counts()
     assert called == []
-
-
-def test_sync_initial_counts_disables_normal_fight_on_failure():
-    """校准抛异常 → 不降级, 直接禁用 NormalFightTrigger 并提示 (不阻塞主循环)。"""
-    from autowsgr.scheduler.triggers import NormalFightPlan, NormalFightTrigger
-
-    def boom() -> None:
-        raise RuntimeError('OCR 不可用')
-
-    ctx = _ctx_with_da(_FakeDA(stop_max_ship=True))
-    ctx.sync_daily_drop_counts = boom  # type: ignore[method-assign]
-
-    plan = NormalFightPlan(factory=lambda _c: object(), name='x', fleet_id=1)
-    trigger = NormalFightTrigger(priority=100, name='常规战', plans=[plan])
-
-    sched = TaskScheduler(ctx, expedition_interval=0)  # type: ignore[arg-type]
-    sched.register_trigger(trigger)
-    sched._sync_initial_counts()  # 不抛
-
-    assert trigger._disabled is True
-    assert trigger.should_fire(ctx) is None  # 禁用后不再产出
 
 
 # ── GameContext.sync_daily_drop_counts (识别 + 同步每日计数器) ──
@@ -679,3 +663,34 @@ def test_register_normal_fight_passes_condition(monkeypatch: pytest.MonkeyPatch)
 
     trigger = sched._triggers[-1]
     assert trigger._plans[0].conditions == (GradeCondition('F', 'S'),)
+
+
+# ── NormalFightPlan.results 记录 (run_yaml_plan 统计链路) ──────────────────
+
+
+def test_normal_fight_plan_records_all_results():
+    """_on_done 把每场 CombatResult 记入 plan.results (含未达标场)。
+
+    背景: 触发器模式 (run_daily) 下 scheduler.tasks[0].results 恒为空,
+    run_yaml_plan 的调用方 (run_h5_acd.py) 统计一直是 0 场。修复后每场
+    结果由 NormalFightTrigger._on_done 记录在 plan.results。
+    """
+    from autowsgr.combat import GradeCondition
+
+    trigger, plan = _make_normal_trigger(
+        conditions=(GradeCondition(node='F', grade='S'),),
+        target=2,
+    )
+    ctx = _ctx_with_da(None)
+
+    # 第 1 场: 评级不足 (记录但不计数)
+    trigger.should_fire(ctx)
+    trigger._on_done(_fight_result('F', 'A'))
+    # 第 2 场: 达标 (记录且计数)
+    trigger.should_fire(ctx)
+    trigger._on_done(_fight_result('F', 'S'))
+
+    assert plan.completed == 1
+    assert len(plan.results) == 2  # 全部记录, 含未达标场
+    assert plan.results[0].flag == ConditionFlag.OPERATION_SUCCESS
+    assert plan.results[1].flag == ConditionFlag.OPERATION_SUCCESS

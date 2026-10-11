@@ -370,10 +370,7 @@ class TestFleetSelectionCallChain:
             lambda _pool, _selectors: next(snapshots),
         )
         monkeypatch.setattr(page, 'detect_fleet_snapshot', lambda **_kwargs: next(snapshots))
-        monkeypatch.setattr(page, 'detect_ship_damage', lambda _screen: {})
         monkeypatch.setattr(page, 'apply_supply', lambda: None)
-        monkeypatch.setattr(page, 'apply_repair', lambda _strategy: None)
-        monkeypatch.setattr(page, 'detect_fleet_info', _FleetInfo)
         monkeypatch.setattr(page, 'start_battle', MagicMock())
         monkeypatch.setattr(page, '_open_choose_page', lambda _slot: FakeChooseShipPage())
         monkeypatch.setattr(normal_fight_module.time, 'sleep', lambda _seconds: None)
@@ -551,7 +548,16 @@ class TestSkipCheckLifecycle:
     主页面) 也被无条件置 True, 下一轮带着"活动页浮层态在"的错误假设直接
     出击 → 按钮匹配不到 → 回退固定坐标盲点误触节点卡片按出浮层 → 超时。
     中途打断/失败一律恢复完整检查。
+
+    2026-10-10 起标记持久化到类级 ``NormalFightRunner._overlay_ready``
+    (键控关卡身份): 触发器模式每轮新建 runner, 实例属性会随轮归零,
+    弹层复用从未生效 (实机日志每轮"已关闭残留关卡浮层")。
     """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_overlay_store(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """每个用例独享空类级集合, 防跨用例污染 (顺序无关)。"""
+        monkeypatch.setattr(NormalFightRunner, '_overlay_ready', set())
 
     @staticmethod
     def _make_runner() -> NormalFightRunner:
@@ -617,3 +623,104 @@ class TestSkipCheckLifecycle:
             runner.run()
 
         assert runner._skip_check is False
+
+    def test_skip_check_survives_new_runner_instance(self, monkeypatch: pytest.MonkeyPatch):
+        """成功标记跨实例可见: 触发器模式每轮新建 runner, 下一轮可直接复用弹层。"""
+        runner = self._make_runner()
+        self._mock_flow(monkeypatch, runner, ConditionFlag.OPERATION_SUCCESS)
+        runner.run()
+
+        fresh = self._make_runner()  # 模拟触发器 factory 下一轮新建
+
+        assert fresh._skip_check is True
+
+    def test_failure_not_visible_to_new_runner(self, monkeypatch: pytest.MonkeyPatch):
+        """失败撤销标记: 新实例仍从完整检查开始。"""
+        runner = self._make_runner()
+        self._mock_flow(monkeypatch, runner, ConditionFlag.OPERATION_SUCCESS)
+        runner.run()
+
+        runner2 = self._make_runner()
+        self._mock_flow(monkeypatch, runner2, ConditionFlag.SL)
+        runner2.run()
+
+        fresh = self._make_runner()
+
+        assert fresh._skip_check is False
+
+
+class TestEnterEventFastPaths:
+    """弹层循环模式三级路径 (2026-10-09 用户方案):
+
+    1. 已在出征准备页 → 零点击直接开始;
+    2. 关卡详情弹层在屏 → 仅点一次「出击准备」;
+    3. 其他页面 → 完整导航选关兜底。
+    """
+
+    @staticmethod
+    def _make_runner(skip_check: bool = False) -> NormalFightRunner:
+        runner = TestSkipCheckLifecycle._make_runner()
+        runner._skip_check = skip_check
+        runner._ctrl = MagicMock()
+        return runner
+
+    def _run_enter_event(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        runner: NormalFightRunner,
+        *,
+        prep_page: bool,
+        overlay: bool,
+    ) -> dict[str, Any]:
+        import autowsgr.ui.battle.preparation as prep_mod
+
+        calls: dict[str, Any] = {'goto': 0, 'start_fight': [], 'page_built': 0}
+        page = MagicMock()
+        page.is_fight_ready.return_value = overlay
+        page.start_fight.side_effect = (
+            lambda *a, **k: calls['start_fight'].append(
+                k.get('skip_check', a[2] if len(a) > 2 else None)
+            )
+        )
+        fake_page_cls = MagicMock(
+            side_effect=lambda *a, **k: (calls.__setitem__('page_built', calls['page_built'] + 1), page)[1]
+        )
+        monkeypatch.setattr(normal_fight_module, 'BaseEventPage', fake_page_cls)
+        monkeypatch.setattr(
+            normal_fight_module,
+            'goto_page',
+            lambda *a, **k: calls.__setitem__('goto', calls['goto'] + 1),
+        )
+        page_match = SimpleNamespace(matched=prep_page)
+        monkeypatch.setattr(
+            prep_mod.BattlePreparationPage,
+            'is_current_page',
+            staticmethod(lambda s: page_match),
+        )
+
+        runner._enter_event()
+        return calls
+
+    def test_prep_page_direct_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """已在准备页 → 零点击零导航, 直接开始本轮。"""
+        runner = self._make_runner()
+        calls = self._run_enter_event(monkeypatch, runner, prep_page=True, overlay=False)
+        assert calls['goto'] == 0
+        assert calls['page_built'] == 0
+        assert calls['start_fight'] == []
+
+    def test_overlay_clicks_fight_button(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """弹层在屏 → 仅构造页面并点「出击准备」(skip_check=True 跳选关)。"""
+        runner = self._make_runner()
+        calls = self._run_enter_event(monkeypatch, runner, prep_page=False, overlay=True)
+        assert calls['goto'] == 0
+        assert calls['page_built'] == 1
+        assert calls['start_fight'] == [True]
+
+    def test_full_navigation_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """其他页面 (首次/SL 后) → 完整导航, skip_check 透传。"""
+        runner = self._make_runner(skip_check=False)
+        calls = self._run_enter_event(monkeypatch, runner, prep_page=False, overlay=False)
+        assert calls['goto'] == 1
+        assert calls['page_built'] == 2  # 弹层检测 + 导航后各构造一次
+        assert calls['start_fight'] == [False]

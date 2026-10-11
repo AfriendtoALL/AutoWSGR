@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from autowsgr.combat.actions import check_blood
 from autowsgr.combat.fleet import FleetSlotRule, ShipSelector
 from autowsgr.combat.history import (
     CombatEvent,
@@ -67,6 +66,12 @@ class TestResolveSuccessors:
         assert result == [CombatPhase.MAP_PAGE]
 
     def test_normal_night_no(self):
+        """夜战选择 (yes/no) 后进战果结算页 (RESULT)。
+
+        状态机等待期绝不盲点 (实机 2026-10-10: 等待期盲点把夜战动画点穿、
+        PROCEED 对话框被误认成夜战提示); 结算三层由处理器层
+        handlers._blind_skip_settlement 在 RESULT 触发后盲点穿行。
+        """
         normal = MODE_TRANSITIONS[CombatMode.NORMAL]
         result = resolve_successors(normal, CombatPhase.NIGHT_PROMPT, 'no')
         assert result == [CombatPhase.RESULT]
@@ -763,65 +768,6 @@ class TestFleetPresetsParsing:
             ShipSelector(name='大淀', search_name='大淀'),
             ShipSelector(name='大淀', search_name='大淀·改'),
         )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# actions.py 测试
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-class TestCheckBlood:
-    """check_blood 测试。"""
-
-    def test_all_green_continues(self):
-        s = ShipDamageState
-        r = RepairMode
-        stats = [s.NORMAL, s.NORMAL, s.NORMAL, s.NORMAL, s.NORMAL, s.NORMAL]
-        assert check_blood(stats, r.severe_damage) is True
-
-    def test_severe_damage_stops(self):
-        s = ShipDamageState
-        r = RepairMode
-        stats = [s.NORMAL, s.NORMAL, s.SEVERE, s.NORMAL, s.NORMAL, s.NORMAL]
-        assert check_blood(stats, r.severe_damage) is False
-
-    def test_moderate_damage_with_severe_rule(self):
-        s = ShipDamageState
-        r = RepairMode
-        stats = [s.NORMAL, s.NORMAL, s.MODERATE, s.NORMAL, s.NORMAL, s.NORMAL]
-        assert check_blood(stats, r.severe_damage) is True
-
-    def test_no_ship_ignored(self):
-        s = ShipDamageState
-        r = RepairMode
-        stats = [s.NORMAL, s.NORMAL, s.NORMAL, s.NO_SHIP, s.NO_SHIP, s.NO_SHIP]
-        assert check_blood(stats, r.severe_damage) is True
-
-    def test_per_position_rules(self):
-        s = ShipDamageState
-        r = RepairMode
-        stats = [s.NORMAL, s.MODERATE, s.SEVERE, s.NORMAL, s.NORMAL, s.NORMAL]
-        rules = [
-            r.severe_damage,
-            r.moderate_damage,
-            r.severe_damage,
-            r.severe_damage,
-            r.severe_damage,
-            r.severe_damage,
-        ]
-        assert check_blood(stats, rules) is False  # position 1 has MODERATE >= moderate_damage
-
-    def test_severe_always_stops(self):
-        s = ShipDamageState
-        r = RepairMode
-        stats = [s.NORMAL, s.NORMAL, s.SEVERE, s.NORMAL, s.NORMAL, s.NORMAL]
-        assert check_blood(stats, r.severe_damage) is False
-
-    def test_moderate_stops_with_moderate_rule(self):
-        s = ShipDamageState
-        r = RepairMode
-        stats = [s.NORMAL, s.MODERATE, s.NORMAL, s.NORMAL, s.NORMAL, s.NORMAL]
-        assert check_blood(stats, r.moderate_damage) is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

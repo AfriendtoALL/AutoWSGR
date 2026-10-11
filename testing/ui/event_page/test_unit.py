@@ -4,7 +4,9 @@
   - ``is_current_page``: 三层锚点 (出击按钮浮层态 / 难度图标干净页 / 标题兜底)
   - ``_enter_node``: 出击按钮出现确认节点选择成功 (单帧, 替代旧双帧浮层检测)
   - ``go_back``: 纯模板驱动 (出击按钮可见 = 浮层在 → 点红色 X; 否则点返回)
-  - ``ensure_no_overlay``: 出击按钮可见 = 浮层在 → 点 X → 按钮消失确认
+
+注: ``ensure_no_overlay`` (关闭活动浮层操作) 已按用户要求移除 (2026-10-08,
+该活动无需此操作, 面板态由「出击准备」按钮直接接管)。
 """
 
 from __future__ import annotations
@@ -235,38 +237,6 @@ class TestGoBack:
 
 
 # ─────────────────────────────────────────────
-# ensure_no_overlay (战后浮层清理: 出击按钮锚点)
+# ensure_no_overlay (已移除: 该活动无需关闭浮层操作, 面板态由
+# 「出击准备」按钮直接接管 —— 原三个用例随功能一并删除)
 # ─────────────────────────────────────────────
-
-
-class TestEnsureNoOverlay:
-    """背景 (实机 2026-08-15 日志): H5 打完一场回港, 活动页直接落在关卡详情
-    浮层态 (战后 UI 流转跳过出征准备页), 模态浮层拦截一切点击 → 死循环。"""
-
-    def test_clean_page_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """出击按钮不可见 → 已是干净页, 不点击。"""
-        page, ctrl = _make_page()
-        ctrl.screenshot.return_value = _gradient_screen()
-        _mock_fight_button(monkeypatch, [None])
-
-        page.ensure_no_overlay()
-
-        ctrl.click.assert_not_called()
-
-    def test_overlay_closed_then_button_gone(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """按钮可见 (浮层在) → 点 X 后按钮消失 → 关闭成功, 只点一次。"""
-        page, ctrl = _make_page()
-        _mock_fight_button(monkeypatch, [_button_detail(), None])
-
-        page.ensure_no_overlay()
-
-        assert ctrl.click.call_args_list == [call(*CLICK_CLOSE_NODE_OVERLAY)]
-
-    def test_gives_up_after_three_rounds(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """按钮一直可见 (点 X 无效) → 3 轮后放弃。"""
-        page, ctrl = _make_page()
-        _mock_fight_button(monkeypatch, [_button_detail()] * 4)
-
-        page.ensure_no_overlay()
-
-        assert ctrl.click.call_count == 3
