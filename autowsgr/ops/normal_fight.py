@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, Literal
 
 from autowsgr.combat import CombatMode, CombatPlan, CombatResult
 from autowsgr.combat.engine import run_combat
@@ -42,6 +42,24 @@ def _require_fleet_change(success: bool, source: str) -> None:
     """换船失败时停止出征，避免使用错误舰队进入战斗。"""
     if not success:
         raise ActionFailedError(f'{source} 编队失败')
+
+
+def _overlay_store(ctx: GameContext) -> set[tuple[str | None, str, str | None]]:
+    """取 ctx 上的弹层复用集合, 缺失时补建。
+
+    :attr:`GameContext.overlay_ready_maps` 是标准字段, 但测试替身 (或将来
+    某些轻量构造路径) 可能没带它。用 ``getattr`` + 自动补建而非直接访问,
+    可避免「构造 runner时因缺字段崩溃」——弹层复用只是**优化**, 拿不到就
+    退化成每轮完整检查, 不该因此让整个出征失败。
+    """
+    store = getattr(ctx, 'overlay_ready_maps', None)
+    if store is None:
+        store = set()
+        try:
+            ctx.overlay_ready_maps = store  # type: ignore[attr-defined]
+        except AttributeError:  # 只读/ slots 对象: 退化为每轮独立集合
+            _log.debug('[OPS] ctx 不支持 overlay_ready_maps, 弹层复用降级')
+    return store
 
 
 class NormalFightRunner:
@@ -105,11 +123,11 @@ class NormalFightRunner:
 
         # 仅上一轮 OPERATION_SUCCESS (成功完成战斗, 战后回港必落关卡浮层态)
         # 才跳过难度/节点检查直接出击; 中途打断/失败一律恢复完整检查 (仅
-        # event 分支使用)。触发器模式每轮新建 runner 实例, 该前提必须跨
-        # 实例存活 → 落在类级集合 (按关卡身份键控), 实例初始化时查表播种
-        # (实机 2026-10-08: 实例属性每轮归零, 每轮都日志"已关闭残留关卡
-        # 浮层", 弹层复用从未生效)。
-        self._skip_check = self._overlay_key() in NormalFightRunner._overlay_ready
+        # event 分支使用)。触发器模式每轮经 factory 新建 runner 实例, 实例
+        # 属性会归零, 该前提必须跨实例存活 → 落在 ctx 上 (触发器模式下同一
+        # ctx 跨轮存活), 按关卡身份键控 (实机 2026-10-08: 实例属性每轮归零,
+        # 每轮都日志"已关闭残留关卡浮层", 弹层复用从未生效)。
+        self._skip_check = self._overlay_key() in _overlay_store(ctx)
 
         self._results: list[CombatResult] = []
         self._loot_count: int | None = None
@@ -118,27 +136,23 @@ class NormalFightRunner:
 
     # ── 跨实例弹层复用标记 ──
 
-    _overlay_ready: ClassVar[set[tuple[str | None, str, str | None]]] = set()
-    """「上一场成功完成、战后回港弹层可直接复用再出击」的关卡身份类级集合。
-
-    键 = (活动代号, 地图代码, 入口)。触发器模式每轮经 factory 新建
-    :class:`NormalFightRunner`，实例属性 ``_skip_check`` 会随之归零
-    (实机 2026-10-08: 每轮日志"已关闭残留关卡浮层"，弹层复用从未生效)，
-    故该前提持久化到类级，按关卡身份区分，不跨计划串扰。
-    """
-
     def _overlay_key(self) -> tuple[str | None, str, str | None]:
         """当前计划的关卡身份键 (活动代号, 地图代码, 入口)。"""
         return (self._plan.event_name, self._map_code, self._plan.entrance)
 
     def _mark_overlay_ready(self, ready: bool) -> None:
-        """同步弹层复用标记到实例属性与类级集合。"""
+        """同步弹层复用标记到实例属性与 :attr:`GameContext.overlay_ready_maps`。
+
+        状态挂在 ctx 而非类变量: 触发器模式每轮新建 runner, 且 ctx 跨轮存活;
+        类变量则是进程级共享 (同进程跑不同计划会串扰、重启即丢、永不清理)。
+        """
         self._skip_check = ready
         key = self._overlay_key()
+        store = _overlay_store(self._ctx)
         if ready:
-            NormalFightRunner._overlay_ready.add(key)
+            store.add(key)
         else:
-            NormalFightRunner._overlay_ready.discard(key)
+            store.discard(key)
 
     # ── 公共接口 ──
 

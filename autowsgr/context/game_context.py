@@ -121,6 +121,27 @@ class GameContext:
     daily_overlay_date: date | None = None
     """最近一次完成主页面浮层处理的日期 (时间戳 gate: 每日 0 点后首次处理, 跨日失效)。"""
 
+    overlay_ready_maps: set[tuple[str | None, str, str | None]] = field(
+        default_factory=set
+    )
+    """"上一场成功打完、战后回港弹层可直接复用再出击"的关卡身份集合。
+
+    键 = ``(活动代号, 地图代码, 入口)``, 详见
+    :attr:`autowsgr.ops.normal_fight.NormalFightRunner._overlay_key`。
+
+    **为什么放在 ctx 而非 runner 类变量** (2026-10-11):
+
+    触发器模式每轮经 ``plan.factory(ctx)`` 新建 runner, 实例属性每轮归零,
+    导致弹层复用从不生效 (实机 2026-10-08: 每轮都日志「已关闭残留关卡
+    浮层」)。原先把该状态挂在 ``NormalFightRunner._overlay_ready`` 类变量上,
+    但类变量是**进程级**的 —— 同进程跑不同计划会共享、进程重启即丢失、
+    且永不清理。
+
+    ctx 的生命周期恰好匹配: 触发器模式下同一 ctx 跨轮存活 (见
+    ``scheduler/triggers.py`` 的 ``plan.factory(ctx)``), 进程级共享问题
+    也随之消失。
+    """
+
     active_fight_tasks: int = 0
     """当前正在执行的战斗任务数。由 TaskScheduler 维护，用于判断是否可以安全执行浴室维修等会占用舰队的操作。"""
 

@@ -549,25 +549,38 @@ class TestSkipCheckLifecycle:
     出击 → 按钮匹配不到 → 回退固定坐标盲点误触节点卡片按出浮层 → 超时。
     中途打断/失败一律恢复完整检查。
 
-    2026-10-10 起标记持久化到类级 ``NormalFightRunner._overlay_ready``
-    (键控关卡身份): 触发器模式每轮新建 runner, 实例属性会随轮归零,
+    2026-10-11 起标记持久化到 :attr:`GameContext.overlay_ready_maps`
+    (键控关卡身份): 触发器模式每轮经 factory 新建 runner, 实例属性会随轮归零,
     弹层复用从未生效 (实机日志每轮"已关闭残留关卡浮层")。
+
+    此前挂在 ``NormalFightRunner._overlay_ready`` 类变量上, 但类变量是进程级的
+    (同进程跑不同计划会共享、重启即丢、永不清理); ctx 在触发器模式下跨轮存活,
+    生命周期恰好匹配。
     """
 
-    @pytest.fixture(autouse=True)
-    def _isolated_overlay_store(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """每个用例独享空类级集合, 防跨用例污染 (顺序无关)。"""
-        monkeypatch.setattr(NormalFightRunner, '_overlay_ready', set())
-
-    @staticmethod
-    def _make_runner() -> NormalFightRunner:
+    @pytest.fixture
+    def _ctx(self) -> SimpleNamespace:
+        """供各用例复用的 ctx (含弹层复用集合)。"""
         cfg = SimpleNamespace(dock_full_destroy=False, destroy_ship_types=None)
-        ctx = SimpleNamespace(
+        return SimpleNamespace(
             ctrl=None,
             config=cfg,
             sync_before_combat=MagicMock(),
             sync_after_combat=MagicMock(),
+            overlay_ready_maps=set(),
         )
+
+    @staticmethod
+    def _make_runner(ctx=None) -> NormalFightRunner:
+        if ctx is None:
+            cfg = SimpleNamespace(dock_full_destroy=False, destroy_ship_types=None)
+            ctx = SimpleNamespace(
+                ctrl=None,
+                config=cfg,
+                sync_before_combat=MagicMock(),
+                sync_after_combat=MagicMock(),
+                overlay_ready_maps=set(),
+            )
         plan = CombatPlan.from_dict({'chapter': 'H', 'map': 5})
         return NormalFightRunner(ctx, plan, resolve_fleet_selection(plan))
 
@@ -624,29 +637,57 @@ class TestSkipCheckLifecycle:
 
         assert runner._skip_check is False
 
-    def test_skip_check_survives_new_runner_instance(self, monkeypatch: pytest.MonkeyPatch):
-        """成功标记跨实例可见: 触发器模式每轮新建 runner, 下一轮可直接复用弹层。"""
-        runner = self._make_runner()
+    def test_skip_check_survives_new_runner_instance(
+        self, monkeypatch: pytest.MonkeyPatch, _ctx,
+    ):
+        """成功标记跨实例可见: 触发器模式每轮新建 runner, 下一轮可直接复用弹层。
+
+        关键: 两个 runner 必须共享**同一个 ctx** —— 这正是
+        ``scheduler/triggers.py`` 里 ``plan.factory(ctx)`` 的真实行为,
+        也是「状态放ctx 而非类变量」成立的前提。
+        """
+        runner = self._make_runner(_ctx)
         self._mock_flow(monkeypatch, runner, ConditionFlag.OPERATION_SUCCESS)
         runner.run()
 
-        fresh = self._make_runner()  # 模拟触发器 factory 下一轮新建
+        fresh = self._make_runner(_ctx)  # 模拟触发器 factory 下一轮新建
 
         assert fresh._skip_check is True
 
-    def test_failure_not_visible_to_new_runner(self, monkeypatch: pytest.MonkeyPatch):
+    def test_failure_not_visible_to_new_runner(
+        self, monkeypatch: pytest.MonkeyPatch, _ctx,
+    ):
         """失败撤销标记: 新实例仍从完整检查开始。"""
-        runner = self._make_runner()
+        runner = self._make_runner(_ctx)
         self._mock_flow(monkeypatch, runner, ConditionFlag.OPERATION_SUCCESS)
         runner.run()
 
-        runner2 = self._make_runner()
+        runner2 = self._make_runner(_ctx)
         self._mock_flow(monkeypatch, runner2, ConditionFlag.SL)
         runner2.run()
 
-        fresh = self._make_runner()
+        fresh = self._make_runner(_ctx)
 
         assert fresh._skip_check is False
+
+    def test_different_ctx_does_not_share_state(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """不同 ctx 之间互不影响 (类变量方案的最大问题之一)。
+
+        同一进程跑两套计划 (如挂机 A + 手动跑 B) 时, ctx 级状态天然隔离。
+        """
+        ctx_a = self._make_runner()._ctx
+        ctx_b = self._make_runner()._ctx
+        assert ctx_a is not ctx_b
+
+        runner_a = self._make_runner(ctx_a)
+        self._mock_flow(monkeypatch, runner_a, ConditionFlag.OPERATION_SUCCESS)
+        runner_a.run()
+
+        # ctx_b 没见过成功, 应从完整检查开始
+        runner_b = self._make_runner(ctx_b)
+        assert runner_b._skip_check is False
 
 
 class TestEnterEventFastPaths:
