@@ -213,6 +213,83 @@ class TestRecoveryAttemptCap:
         assert engine._try_recovery.call_count == 1  # type: ignore[attr-defined]
 
 
+class TestSLCallbackInjection:
+    """SL 的恢复动作必须走**注入的回调**, 而不是引擎自己 import ops。
+
+    迁移前是 ``from autowsgr.ops import restart_game`` (函数内 import), 使
+    ``combat`` 反向依赖 ``ops``, 且 SL 路径无法脱离 ops 环境测试
+    (``fight()`` 此前零覆盖)。改为注入后, 本层可独立构造与测试。
+    """
+
+    def test_on_sl_is_called_on_sl_decision(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """战斗判 SL → 调用注入的 on_sl。"""
+        calls: list[int] = []
+
+        engine = _make_engine(on_sl=lambda: calls.append(1))
+        _stub_fight_setup(monkeypatch, engine)
+        monkeypatch.setattr(
+            engine, '_step', MagicMock(return_value=ConditionFlag.SL)
+        )
+
+        result = engine.fight(_make_plan(), initial_ship_stats=None)
+
+        assert result.flag is ConditionFlag.SL
+        assert calls == [1], '注入的 on_sl 应被调用恰好一次'
+
+    def test_on_sl_not_called_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """正常结束不应触发 on_sl。"""
+        calls: list[int] = []
+
+        engine = _make_engine(on_sl=lambda: calls.append(1))
+        _stub_fight_setup(monkeypatch, engine)
+        monkeypatch.setattr(
+            engine, '_step', MagicMock(return_value=ConditionFlag.FIGHT_END)
+        )
+
+        engine.fight(_make_plan(), initial_ship_stats=None)
+
+        assert calls == []
+
+    def test_sl_without_callback_still_reports(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """未注入 on_sl 时 SL 仍要正常记结果 (只是不重启游戏)。
+
+        ``_make_engine`` 默认不注入回调 —— 这条保证引擎可独立测试。
+        """
+        engine = _make_engine()
+        _stub_fight_setup(monkeypatch, engine)
+        monkeypatch.setattr(
+            engine, '_step', MagicMock(return_value=ConditionFlag.SL)
+        )
+
+        result = engine.fight(_make_plan(), initial_ship_stats=None)
+
+        assert result.flag is ConditionFlag.SL
+
+    def test_combat_layer_does_not_import_ops(self) -> None:
+        """静态检查: ``combat`` 包不得 import ``ops`` (排除注释/文档)。
+
+        这是分层铁律 —— ``combat`` 位于 ``ops`` 之下, 反向依赖会让战斗域
+        无法脱离编排层独立运行与测试。
+        """
+        import re
+        from pathlib import Path
+
+        import autowsgr.combat as combat_pkg
+
+        offenders: list[str] = []
+        pattern = re.compile(r'^\s*(?:from|import)\s+autowsgr\.ops')
+        for py in Path(combat_pkg.__file__).parent.glob('*.py'):
+            for lineno, line in enumerate(
+                py.read_text(encoding='utf-8').splitlines(), 1
+            ):
+                if pattern.match(line):
+                    offenders.append(f'{py.name}:{lineno}: {line.strip()}')
+
+        assert not offenders, (
+            'combat 层不应依赖 ops (应改用回调注入):\n' + '\n'.join(offenders)
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 护栏 2: 步数上限
 # ═══════════════════════════════════════════════════════════════════════════════

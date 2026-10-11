@@ -22,6 +22,7 @@ from autowsgr.combat.fleet import (
 from autowsgr.infra import ActionFailedError
 from autowsgr.infra.logger import get_logger
 from autowsgr.ops.navigate import goto_page
+from autowsgr.ops.startup import restart_game
 from autowsgr.types import ConditionFlag, PageName, ShipDamageState
 from autowsgr.ui import BaseEventPage, BattlePreparationPage, MapPage, MapPanel
 from autowsgr.ui.utils import NavigationError
@@ -468,10 +469,16 @@ class NormalFightRunner:
 
     def _do_combat(self, ship_stats: list[ShipDamageState]) -> CombatResult:
         """构建 CombatEngine 并执行战斗。"""
+        # SL 的恢复动作在此注入 (ops → combat 的正确方向):
+        # combat 不反向 import ops, 故 engine 只需一个回调。
+        def _on_sl() -> None:
+            restart_game(self._ctx.ctrl)
+
         return run_combat(
             self._ctx,
             self._plan,
             ship_stats=ship_stats,
+            on_sl=_on_sl,
         )
 
     # ── 结果处理 ──

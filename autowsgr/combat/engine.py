@@ -88,6 +88,14 @@ class CombatEngine(PhaseHandlersMixin):
         :data:`DEFAULT_MAX_RECOVERY_ATTEMPTS`。
     max_steps:
         单场战斗内允许的状态机步数上限。默认 :data:`DEFAULT_MAX_STEPS`。
+    on_sl:
+        战斗需 SL 重开整局时的恢复动作 (通常由 ops 层注入
+        ``restart_game``)。
+
+        .. note::
+           此前此处直接 ``from autowsgr.ops import restart_game``, 使
+           ``combat`` 反向依赖 ``ops``, 且 SL 路径无法脱离 ops 环境测试。
+           改为注入后, ``combat`` 只依赖同层与下层模块。
     """
 
     def __init__(
@@ -96,6 +104,7 @@ class CombatEngine(PhaseHandlersMixin):
         *,
         max_recovery_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
         max_steps: int = DEFAULT_MAX_STEPS,
+        on_sl: Callable[[], None] | None = None,
     ) -> None:
         self._ctx = ctx
         self._device = ctx.ctrl
@@ -104,6 +113,9 @@ class CombatEngine(PhaseHandlersMixin):
         # 熔断护栏 (可在构造时覆盖)
         self._max_recovery_attempts = max_recovery_attempts
         self._max_steps = max_steps
+
+        # SL 恢复动作 (由 ops 层注入, 见类文档 on_sl 说明)
+        self._on_sl = on_sl
 
         # 运行时状态 (由 fight() 重置)
         self._plan: CombatPlan = CombatPlan(name='', mode=CombatMode.BATTLE)
@@ -273,11 +285,13 @@ class CombatEngine(PhaseHandlersMixin):
                 result.flag = ConditionFlag.DOCK_FULL
                 break
             elif decision == ConditionFlag.SL:
-                # TODO: 这里出现了轻微的抽象泄露，因为 SL 需要调用 restart_game
+                # SL 的恢复动作 (重启游戏) 由 ops 层注入 —— combat 不反向
+                # 依赖 ops, 也不 import 该动作, 保证本层可独立测试。
                 result.flag = ConditionFlag.SL
-                from autowsgr.ops import restart_game
-
-                restart_game(self._device)
+                if self._on_sl is not None:
+                    self._on_sl()
+                else:
+                    _log.warning('[Combat] SL 但未注入恢复动作 (on_sl=None), 跳过重启')
                 break
             elif decision == ConditionFlag.SKIP_FIGHT:
                 # 索敌后主动撤退 (节点不在白名单/规则撤退): 不是成功打完,
@@ -476,7 +490,15 @@ def run_combat(
     plan: CombatPlan,
     *,
     ship_stats: list[ShipDamageState],
+    on_sl: Callable[[], None] | None = None,
 ) -> CombatResult:
-    """执行一次完整战斗的便捷函数。"""
-    engine = CombatEngine(ctx=ctx)
+    """执行一次完整战斗的便捷函数。
+
+    Parameters
+    ----------
+    on_sl:
+        SL 时的恢复动作 (通常由调用方注入 ``restart_game``)。``None`` 时
+        SL 只记结果不重启游戏。
+    """
+    engine = CombatEngine(ctx=ctx, on_sl=on_sl)
     return engine.fight(plan, initial_ship_stats=ship_stats)

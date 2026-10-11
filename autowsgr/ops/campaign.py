@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from autowsgr.combat import CombatEngine, CombatMode, CombatPlan, CombatResult, NodeDecision
 from autowsgr.infra.logger import get_logger
 from autowsgr.ops.navigate import goto_page
+from autowsgr.ops.startup import restart_game
 from autowsgr.types import ConditionFlag, Formation, PageName, RepairMode, ShipDamageState
 from autowsgr.ui import (
     BattlePreparationPage,
@@ -139,7 +140,8 @@ class CampaignRunner:
     ) -> None:
         self._ctx = ctx
         self._ctrl = ctx.ctrl
-        self._engine = CombatEngine(ctx)
+        # SL 恢复动作由 ops 层注入, combat 不反向 import ops
+        self._engine = CombatEngine(ctx, on_sl=lambda: restart_game(ctx.ctrl))
         self._campaign_name = campaign_name
         self._times = times
         self._formation = formation
