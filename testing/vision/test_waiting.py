@@ -153,22 +153,46 @@ class TestCombatLayerIsIndependent:
     """``combat`` 不应加载任何 ``ui`` 模块。"""
 
     def test_importing_combat_loads_no_ui(self) -> None:
-        """导入整个 combat 包后, ``sys.modules`` 里不应有 autowsgr.ui.*。
+        """在**子进程**中导入 combat 包, 断言不加载任何 ui 模块。
 
-        这是比静态 grep 更强的保证 —— 静态检查只能看到显式 import,
-        这里能捕获**间接**导入链 (combat → ui → combat 的环等)。
+        比静态 grep 更强: 能捕获**间接**导入链 (combat → ops → ui 等)。
+
+        必须在独立进程里做 —— 本进程可能已由其他测试加载过 ui
+        (例如 testing/ui/ 下的用例), 那会让检查误报为失败。首版就在
+        全量测试时栽在这里: 单跑全绿, 全量跑失败。
         """
-        for name in [m for m in sys.modules if m.startswith('autowsgr.combat')]:
-            del sys.modules[name]
+        import subprocess
+        import sys as _sys
 
-        import autowsgr.combat  # noqa: F401
-        import autowsgr.combat.engine  # noqa: F401
-        import autowsgr.combat.handlers  # noqa: F401
-        import autowsgr.combat.recognizer  # noqa: F401
-        import autowsgr.combat.node_tracker  # noqa: F401
+        probe = (
+            'import sys\n'
+            'import autowsgr.combat\n'
+            'import autowsgr.combat.engine\n'
+            'import autowsgr.combat.handlers\n'
+            'import autowsgr.combat.recognizer\n'
+            'import autowsgr.combat.node_tracker\n'
+            'ui = [m for m in sys.modules if m.startswith("autowsgr.ui")]\n'
+            'print("UI_MODS:" + ",".join(sorted(ui)))\n'
+        )
+        proc = subprocess.run(  # noqa: S603
+            [_sys.executable, '-c', probe],
+            capture_output=True,
+            timeout=180,
+            check=False,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+        )
 
-        ui_mods = sorted(m for m in sys.modules if m.startswith('autowsgr.ui'))
-        assert not ui_mods, f'导入 combat 却加载了 ui 模块: {ui_mods[:5]}'
+        assert proc.returncode == 0, f'子进程导入失败:\n{proc.stderr[-800:]}'
+
+        line = next(
+            (ln for ln in proc.stdout.splitlines() if ln.startswith('UI_MODS:')), None
+        )
+        assert line is not None, f'子进程未输出检查结果:\n{proc.stdout[-500:]}'
+
+        loaded = line.removeprefix('UI_MODS:').strip()
+        assert not loaded, f'导入 combat 却加载了 ui 模块: {loaded.split(",")[:5]}'
 
     def test_no_static_import_of_ui(self) -> None:
         """静态检查: combat 包不得 import ui / ops (AST 精确判定)。"""
