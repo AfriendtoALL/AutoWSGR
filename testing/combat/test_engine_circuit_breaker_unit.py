@@ -266,24 +266,30 @@ class TestSLCallbackInjection:
         assert result.flag is ConditionFlag.SL
 
     def test_combat_layer_does_not_import_ops(self) -> None:
-        """静态检查: ``combat`` 包不得 import ``ops`` (排除注释/文档)。
+        """静态检查: ``combat`` 包不得 import ``ops`` (用 AST 精确判定)。
 
-        这是分层铁律 —— ``combat`` 位于 ``ops`` 之下, 反向依赖会让战斗域
-        无法脱离编排层独立运行与测试。
+        ``combat`` 位于 ``ops`` 之下, 反向依赖会让战斗域无法脱离编排层
+        独立运行与测试 (SL 路径此前因此无法单测)。
+
+        用 AST 而非正则 —— 正则会被行内其他下划线干扰, 且对
+        ``import x.y as z`` / 多行 import 处理不准。
         """
-        import re
+        import ast
         from pathlib import Path
 
         import autowsgr.combat as combat_pkg
 
         offenders: list[str] = []
-        pattern = re.compile(r'^\s*(?:from|import)\s+autowsgr\.ops')
         for py in Path(combat_pkg.__file__).parent.glob('*.py'):
-            for lineno, line in enumerate(
-                py.read_text(encoding='utf-8').splitlines(), 1
-            ):
-                if pattern.match(line):
-                    offenders.append(f'{py.name}:{lineno}: {line.strip()}')
+            tree = ast.parse(py.read_text(encoding='utf-8'))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    if (node.module or '').startswith('autowsgr.ops'):
+                        offenders.append(f'{py.name}:{node.lineno}: from {node.module}')
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name.startswith('autowsgr.ops'):
+                            offenders.append(f'{py.name}:{node.lineno}: import {alias.name}')
 
         assert not offenders, (
             'combat 层不应依赖 ops (应改用回调注入):\n' + '\n'.join(offenders)

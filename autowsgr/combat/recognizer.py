@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
+from autowsgr.data.event_config import event_title_templates, fight_button_templates
 from autowsgr.image_resources import TemplateKey
 from autowsgr.infra import get_logger
 from autowsgr.vision import (
@@ -95,13 +96,10 @@ def _get_event_map_templates() -> list[ImageTemplate]:
     ``allow_event_overlay_anchor`` 开关, 由引擎在**行军起始阶段**
     (``START_FIGHT``) 关闭按钮锚点, 仅战斗流程后段 (RESULT/GET_SHIP/
     PROCEED 之后, 弹层只可能真实出现在这些阶段) 启用。
-    """
-    from autowsgr.ui.event.event_page import (
-        _get_event_title_templates,
-        _get_fight_button_templates,
-    )
-
-    return [*_get_event_title_templates(), *_get_fight_button_templates()]
+"""
+    # 模板数据由 data/event/*.yaml 提供 (T2-3 参数化), 这里直接读数据层 ——
+    # 战斗域不再反向依赖 UI 层的私有函数 (T3-2)。
+    return [*event_title_templates(), *fight_button_templates()]
 
 
 def _is_event_overlay_button(template: ImageTemplate) -> bool:

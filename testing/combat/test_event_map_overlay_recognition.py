@@ -47,6 +47,60 @@ def _template_names(templates) -> set[str]:
     return {t.name for t in templates}
 
 
+def test_combat_layer_does_not_import_ui_private_helpers() -> None:
+    """combat 不得从 ui 层 import **私有模板函数** (分层铁律, T3-2)。
+
+    迁移前 ``recognizer._get_event_map_templates`` 直接 import
+    ``ui.event.event_page`` 的两个**下划线私有函数**。模板数据本就归
+    ``data/event/*.yaml`` 所有, 现改为读数据层。
+
+    .. note::
+       本项只查「私有符号」。``handlers.py`` 目前仍 import
+       ``ui.utils.wait_leave_page`` (公共工具), 该项在 T3-2 步骤 4 下沉,
+       届时再加全面检查。
+    """
+    import ast
+    from pathlib import Path
+
+    import autowsgr.combat as combat_pkg
+
+    offenders: list[str] = []
+    for py in Path(combat_pkg.__file__).parent.glob('*.py'):
+        tree = ast.parse(py.read_text(encoding='utf-8'))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            module = node.module or ''
+            if not module.startswith('autowsgr.ui'):
+                continue
+            for alias in node.names:
+                # 只认下划线开头的**私有符号**(与 PEP 8 一致)
+                if alias.name.startswith('_'):
+                    offenders.append(
+                        f'{py.name}:{node.lineno}: from {module} import {alias.name}'
+                    )
+
+    assert not offenders, (
+        'combat 层不应从 ui 导入私有符号 (应读 data.event_config):\n'
+        + '\n'.join(offenders)
+    )
+
+
+def test_event_map_templates_read_from_data_layer() -> None:
+    """合并后的模板集合应与 data 层一致 (单一事实来源)。"""
+    from autowsgr.combat.recognizer import _get_event_map_templates
+    from autowsgr.data.event_config import (
+        event_title_templates,
+        fight_button_templates,
+    )
+
+    merged = _get_event_map_templates()
+    expected = [*event_title_templates(), *fight_button_templates()]
+
+    assert len(merged) == len(expected)
+    assert {t.name for t in merged} == {t.name for t in expected}
+
+
 class TestEventMapSignature:
     def test_signature_includes_fight_button_templates(self):
         """签名模板 = 活动标题图 + 出击准备按钮 (弹层态锚点)。"""

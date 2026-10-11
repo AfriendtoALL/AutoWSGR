@@ -38,7 +38,7 @@ from autowsgr.infra.logger import get_logger
 
 
 if TYPE_CHECKING:
-    from autowsgr.image_resources import ImageTemplate
+    from autowsgr.vision.image_template import ImageTemplate
 
 
 _log = get_logger('data.event')
@@ -207,3 +207,49 @@ def load_event_config(event_name: str) -> EventConfig:
 def has_event_config(event_name: str) -> bool:
     """是否已有该期号的配置文件 (不加缓存, 供探查用)。"""
     return (EVENT_CONFIG_DIR / f'{event_name}.yaml').exists()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 模板集合 (T3-2 步骤 2)
+#
+# 这两个函数原在 ``ui/event/event_page.py``, combat 层的
+# ``recognizer._get_event_map_templates`` 直接 import 了它们 (两个**下划线
+# 私有函数**) —— 战斗域反向依赖 UI 层。
+#
+# 模板数据本就归 ``data/event/*.yaml`` 所有 (T2-3), 让 combat 绕过 UI 直接
+# 读数据层, 依赖方向变为 combat → data, 与分层一致。UI 层改为复用这里的
+# 实现, 保持单一事实来源。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _collect_templates(kind: str) -> tuple[ImageTemplate, ...]:
+    """按 :data:`DEFAULT_NAV_ORDER` 顺序收集某类模板。
+
+    跳过未声明该类模板的期号 (如 20260212 只有入口图标)。
+    """
+    out: list[ImageTemplate] = []
+    for event_name in DEFAULT_NAV_ORDER:
+        cfg = load_event_config(event_name)
+        if not cfg.has_templates(kind):
+            continue
+        out.extend(cfg.templates(kind))
+    return tuple(out)
+
+
+@functools.lru_cache(maxsize=1)
+def event_title_templates() -> tuple[ImageTemplate, ...]:
+    """全部活动期的地图页标题模板 (``templates.title``)。
+
+    供页面识别使用: ``find_any`` 命中任一即认定为活动地图页面。
+    """
+    return _collect_templates('title')
+
+
+@functools.lru_cache(maxsize=1)
+def fight_button_templates() -> tuple[ImageTemplate, ...]:
+    """全部活动期的关卡详情浮层出击按钮 (``templates.fight_button``)。
+
+    模板 ``name`` 以 ``fight_button`` 开头 —— ``combat/recognizer.py`` 的
+    ``_is_event_overlay_button`` 依赖此前缀区分模板用途, 勿改。
+    """
+    return _collect_templates('fight_button')

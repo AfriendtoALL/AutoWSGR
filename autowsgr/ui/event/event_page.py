@@ -21,6 +21,10 @@ import time
 from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
+from autowsgr.data.event_config import (
+    event_title_templates,
+    fight_button_templates,
+)
 from autowsgr.infra.exceptions import ActionFailedError
 from autowsgr.infra.logger import get_logger
 from autowsgr.types import PageName
@@ -58,18 +62,11 @@ def _get_fight_button_templates() -> list[ImageTemplate]:
     相比, 按钮样式跨活动差异小), 且匹配位置 ``center`` 可直接用作点击坐标,
     布局微调也无需改坐标常量。
 
-    模板声明来自 ``autowsgr/data/event/<期号>.yaml`` 的 ``templates.fight_button``
-    (2026-10-11 T2-3 参数化), 按 :data:`DEFAULT_NAV_ORDER` 顺序合并。
+    实现已下沉到 :func:`autowsgr.data.event_config.fight_button_templates`
+    (2026-10-11 T3-2: combat 层也需这组模板, 原本它反向 import 本模块的
+    私有函数)。此处仅保留薄封装, 供 UI 层沿用既有调用点。
     """
-    from autowsgr.data.event_config import DEFAULT_NAV_ORDER, load_event_config
-
-    out: list[ImageTemplate] = []
-    for event_name in DEFAULT_NAV_ORDER:
-        cfg = load_event_config(event_name)
-        if not cfg.has_templates('fight_button'):
-            continue
-        out.extend(cfg.templates('fight_button'))
-    return out
+    return list(fight_button_templates())
 
 
 @lru_cache(maxsize=1)
@@ -81,18 +78,10 @@ def _get_event_title_templates() -> list[ImageTemplate]:
     匹配引擎按 ``source_resolution`` 自动缩放, 540p/720p 模板可共存;
     页面识别时 ``find_any`` 命中任一即认定为活动地图页面。
 
-    模板声明来自 ``autowsgr/data/event/<期号>.yaml`` 的 ``templates.title``
-    (2026-10-11 T2-3 参数化)。
+    实现见 :func:`autowsgr.data.event_config.event_title_templates`
+    (T3-2 下沉, 与 combat 层共用同一份, 避免两处各自遍历配置)。
     """
-    from autowsgr.data.event_config import DEFAULT_NAV_ORDER, load_event_config
-
-    out: list[ImageTemplate] = []
-    for event_name in DEFAULT_NAV_ORDER:
-        cfg = load_event_config(event_name)
-        if not cfg.has_templates('title'):
-            continue
-        out.extend(cfg.templates('title'))
-    return out
+    return list(event_title_templates())
 
 
 # ── 难度切换按钮图标模板 (延迟加载) ──────────────────────────────────────
