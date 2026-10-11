@@ -123,15 +123,17 @@ class TestLargestBlob:
 
 
 class TestCombatDoesNotImportCv2Directly:
-    """combat 层不应绕过 vision 直接用 **cv2** (T3-2 步骤 3)。
+    """combat 层不应绕过 vision 直接用第三方视觉库 (T3-2)。
 
-    .. note::
-       只检查 cv2 —— 本步骤的范围是「连通域分析下沉」。
-       ``recognition.py`` 仍有 ``from PIL import Image``, 属图像变换类依赖,
-       归T3-2 步骤 5 一并处理, 此处不做拦截。
+    覆盖 cv2 / PIL —— 后者是步骤 3 顺带发现、步骤 5 清理的残留
+    (``recognition.py`` 曾用 PIL 做「转灰度 + resize」, 现走
+    :func:`autowsgr.vision.transform.to_gray_resized`)。
     """
 
-    def test_no_direct_cv2_in_combat(self) -> None:
+    #: 视觉类第三方库 → 统一走 vision 封装
+    _FORBIDDEN = ('cv2', 'PIL', 'skimage', 'scipy')
+
+    def test_no_direct_vision_lib_in_combat(self) -> None:
         import ast
 
         import autowsgr.combat as combat_pkg
@@ -142,14 +144,14 @@ class TestCombatDoesNotImportCv2Directly:
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
-                        if alias.name.split('.')[0] == 'cv2':
+                        if alias.name.split('.')[0] in self._FORBIDDEN:
                             offenders.append(f'{py.name}:{node.lineno}: import {alias.name}')
                 elif isinstance(node, ast.ImportFrom):
-                    if (node.module or '').split('.')[0] == 'cv2':
+                    if (node.module or '').split('.')[0] in self._FORBIDDEN:
                         offenders.append(f'{py.name}:{node.lineno}: from {node.module}')
 
         assert not offenders, (
-            'combat 层不应直接 import cv2 (应走 vision 封装):\n'
+            'combat 层不应直接 import 第三方视觉库(应走 vision 封装):\n'
             + '\n'.join(offenders)
         )
 

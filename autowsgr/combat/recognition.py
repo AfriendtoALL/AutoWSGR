@@ -13,10 +13,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from PIL import Image
 
 from autowsgr.infra.logger import get_logger
 from autowsgr.vision import ROI, ApiDll, get_api_dll
+from autowsgr.vision.transform import to_gray_resized
 
 
 _log = get_logger('combat.recognition')
@@ -117,10 +117,8 @@ def recognize_enemy_ships(
     if areas is None:
         raise ValueError(f'不支持的模式: {mode!r}，可选: {list(_SCAN_AREAS)}')
 
-    # 转换为 960x540 灰度
-    img = Image.fromarray(screen).convert('L')
-    img = img.resize((960, 540))
-    img_arr = np.array(img)
+    # 转换为 960x540 灰度 (走 vision 封装, T3-2 步骤 5: 不再直接用 PIL)
+    img_arr = to_gray_resized(screen, (960, 540))
 
     # 裁切 6 张缩略图
     crops: list[np.ndarray] = []

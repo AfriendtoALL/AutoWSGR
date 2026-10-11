@@ -20,12 +20,14 @@ from .ship import Ship
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from datetime import date
 
     from autowsgr.combat.history import CombatResult
     from autowsgr.emulator import AndroidController
     from autowsgr.infra import UserConfig
     from autowsgr.types import PageName
+    from autowsgr.ui.map.panels.sortie import LootShipCount
     from autowsgr.vision import OCREngine
 
 
@@ -37,6 +39,29 @@ _NUM_FLEETS = 4
 
 def _default_fleets() -> list[Fleet]:
     return [Fleet(fleet_id=i) for i in range(1, _NUM_FLEETS + 1)]
+
+
+def _default_drop_counts_interactor(ctx: GameContext) -> 'LootShipCount':
+    """读取每日掉落计数的默认实现 (含全部 UI 交互)。
+
+    **ui / ops 的依赖集中在这里, 且只在函数内导入** —— ``context`` 层
+    本身不依赖它们 (2026-10-11 T3-2 步骤 5)。测试可注入替身绕开设备。
+    """
+    from autowsgr.ops import goto_page
+    from autowsgr.types import PageName
+    from autowsgr.ui import MapPage, MapPanel
+
+    goto_page(ctx, PageName.MAP)
+    map_page = MapPage(ctx)
+    map_page.ensure_panel(MapPanel.SORTIE)
+    time.sleep(0.25)
+    # OCR 引擎不可用时 get_loot_and_ship_count 抛 RuntimeError — 不吞, 上抛
+    counts = map_page.get_loot_and_ship_count()
+    try:
+        goto_page(ctx, PageName.MAIN)
+    except Exception:
+        _log.warning('[Context] 每日掉落计数同步后返回主页面失败')
+    return counts
 
 
 @dataclass
@@ -147,6 +172,13 @@ class GameContext:
 
     stop_event: threading.Event = field(default_factory=threading.Event)
     """任务停止信号 (由 TaskManager 设置)。"""
+
+    drop_counts_interactor: Callable[['GameContext'], object] | None = None
+    """读取每日掉落计数的交互实现 (返回含 ``ship``/``loot`` 的对象)。
+
+    ``None`` 时用 :func:`_default_drop_counts_interactor`。注入点用于测试 ——
+    默认实现需要真实设备 (导航到出征面板 + OCR 读数)。
+    """
 
     # ── 便捷访问 ──
 
@@ -270,21 +302,19 @@ class GameContext:
             计数器不再用于门控常规战触发器, 仅作信息统计。本方法保留以便
             需要时手动校准。
 
+        .. note::
+            UI 交互(导航/打开面板/读取计数)通过 ``interactor`` 参数注入
+            (2026-10-11 T3-2 步骤 5: ``context`` 层不该 import ``ui``/``ops``)。
+            默认为 :func:`_default_drop_counts_interactor`, 行为与迁移前一致。
+
         Raises
         ------
         RuntimeError
             OCR 引擎不可用, 无法识别掉落数量。
         """
-        from autowsgr.ops import goto_page
-        from autowsgr.types import PageName
-        from autowsgr.ui import MapPage, MapPanel
+        interactor = self.drop_counts_interactor or _default_drop_counts_interactor
+        counts = interactor(self)
 
-        goto_page(self, PageName.MAP)
-        map_page = MapPage(self)
-        map_page.ensure_panel(MapPanel.SORTIE)
-        time.sleep(0.25)
-        # OCR 引擎不可用时 get_loot_and_ship_count 抛 RuntimeError — 不吞, 上抛
-        counts = map_page.get_loot_and_ship_count()
         if counts.ship is not None:
             self.dropped_ship_count = counts.ship
         if counts.loot is not None:
@@ -294,7 +324,3 @@ class GameContext:
             counts.ship,
             counts.loot,
         )
-        try:
-            goto_page(self, PageName.MAIN)
-        except Exception:
-            _log.warning('[Context] 每日掉落计数同步后返回主页面失败')

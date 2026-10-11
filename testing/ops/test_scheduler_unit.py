@@ -458,14 +458,19 @@ class _FakeSortiePage:
 
 
 def _patch_ctx_sortie(monkeypatch: pytest.MonkeyPatch, page: _FakeSortiePage) -> None:
-    """替换 ctx.sync_daily_drop_counts 的设备依赖 (goto_page / MapPage / sleep) 为 no-op。"""
-    import autowsgr.context.game_context as gc_mod
-    import autowsgr.ops as ops_mod
-    import autowsgr.ui as ui_mod
+    """替换 ctx.sync_daily_drop_counts 的设备依赖为 no-op。
 
-    monkeypatch.setattr(ops_mod, 'goto_page', lambda *_a, **_kw: None)
-    monkeypatch.setattr(ui_mod, 'MapPage', lambda _ctx: page)
-    monkeypatch.setattr(gc_mod, 'time', types.SimpleNamespace(sleep=lambda *_a: None))
+    2026-10-11 T3-2 步骤 5 后, ui/ops 依赖集中在
+    ``_default_drop_counts_interactor`` 内部, context 不再直接 import 它们。
+    故改为**注入 interactor** —— 这正是新字段的用途: 绕开真实设备。
+    """
+    import autowsgr.context.game_context as gc_mod
+
+    def _fake_interactor(_ctx):
+        page.ensure_panel(None)
+        return page.get_loot_and_ship_count()
+
+    monkeypatch.setattr(gc_mod, '_default_drop_counts_interactor', _fake_interactor)
 
 
 def _make_ctx() -> GameContext:
