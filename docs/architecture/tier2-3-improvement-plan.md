@@ -549,20 +549,35 @@ combat/engine.py::fight() 主循环零覆盖
 
 ### 方案
 
-**① 先修 pytest 收集问题**（零风险，立刻做）
+**① 先修 pytest 收集问题** ✅ 已完成 2026-10-11（**原结论有误，已修正**）
 
-把 `testing/ops/` 下非 `test_` 开头的 11 个文件重命名，或加 `conftest.py` 的 `python_files` 配置。
+~~把 `testing/ops/` 下非 `test_` 开头的 11 个文件重命名，或加 `conftest.py` 的
+`python_files` 配置。~~
 
-```python
-# testing/conftest.py
-def pytest_collect_file(file_path, parent):
-    if file_path.suffix == '.py' and file_path.parent.name != 'ops':
-        return None
-    if file_path.suffix == '.py':
-        return parent.session._collectfile(file_path, parent)
-```
+> **实施时实测发现原结论是错的：**
+>
+> - 这些文件里 `test_` 定义数为 **0**，全部带 `if __name__ == '__main__'`
+> - 它们是需要**真实模拟器**的交互式脚本（连接设备 → 真实点击 → 阻塞）
+> - `pytest testing/ops/` 收集到 148 项，**全部来自 10 个 `test_*.py`**，
+>   与这些脚本无关
+>
+> 若按原计划重命名，pytest 会收集它们 → 跑全量时尝试连接不存在的设备
+> → 一片失败。**是把问题引入，不是修复。**
 
-> 更推荐重命名：`build.py` → `test_build.py`，意图明确、工具链无歧义。
+**实际处置：标注 + 保护，而非改名**
+
+| 项 | 内容 |
+| --- | --- |
+| `testing/ops/README.md` | 说明脚本性质、用法、维护约定 |
+| 13 个脚本 docstring | 首行统一标注「实机验证脚本 — 非 pytest 测试」 |
+| `testing/conftest.py` | 新增 `pytest_collect_file` 钩子，误改名立即报错并说明正确做法 |
+| `test_manual_scripts_guard.py` | 57 项，锁住上述机制 |
+
+变异测试：把保护条件改成 `if False` → `test_guard_rejects_renamed_script` 失败。
+
+**教训**：「文件未被 pytest 收集」≠「测试有问题」。判断依据是**内容**
+（有无 `test_` 函数、是否需要真机、能否 mock），不是文件名。
+只看命名就下结论会把好代码改坏。
 
 **② 建截图 fixture 集**
 
@@ -617,7 +632,7 @@ def test_recognizer(case, screen):
 
 | 阶段 | 项目 | 预估工作量 | 风险 | 依赖 |
 |---|---|---|---|---|
-| **立即** | T3-3 ① 修 pytest 收集 | 0.5h | 无 | 无 |
+| **立即** | T3-3 ① 标注+保护 ops 实机脚本 | ✅ 完成 | 无 | 无 |
 | **立即** | T2-1 调度器熔断 | 2~3h | 中 | 无 |
 | **本周** | T2-2 `_overlay_ready` ctx 化 | 1h | 低 | 无 |
 | **本周** | T3-3 ② 截图 fixture | 4~6h | 低 | 需采集截图 |
