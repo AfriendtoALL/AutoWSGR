@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 
 from autowsgr.combat.recognizer import CombatRecognizer
@@ -30,6 +29,7 @@ from autowsgr.vision import (
     PixelChecker,
     PixelRule,
     PixelSignature,
+    largest_blob,
 )
 
 
@@ -390,29 +390,14 @@ class NodeTracker:
             & (b.astype(np.int16) < 150)
         ).astype(np.uint8)
 
-        num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
-            mask,
-            connectivity=8,
-        )
-        # label 0 是背景，跳过
-        if num_labels <= 1:
-            return None
-
-        # 按面积降序排列（排除背景 label 0）
-        _min_area = 200
-        best_label = -1
-        best_area = 0
-        for label_id in range(1, num_labels):
-            area = int(stats[label_id, cv2.CC_STAT_AREA])
-            if area >= _min_area and area > best_area:
-                best_area = area
-                best_label = label_id
-
-        if best_label < 0:
+        # 连通域分析走 vision 封装 (2026-10-11 T3-2): 战斗域不再直接
+        # import cv2, cv2 降为 vision 层的实现细节。
+        blob = largest_blob(mask, min_area=200)
+        if blob is None:
             return None
 
         h, w = screen.shape[:2]
-        cx_abs, cy_abs = centroids[best_label]
+        cx_abs, cy_abs = blob.centroid
         return (cx_abs / w, cy_abs / h)
 
     def is_spot_page(self, screen: np.ndarray) -> bool:

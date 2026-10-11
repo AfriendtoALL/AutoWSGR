@@ -29,6 +29,7 @@
 """
 
 from .api_dll import ApiDll, get_api_dll
+from .blob import Blob, largest_blob
 from .image_matcher import TEMPLATE_SOURCE_RESOLUTION, ImageChecker
 from .image_template import (
     ImageMatchDetail,
@@ -60,6 +61,9 @@ from .roi import ROI
 
 
 __all__ = [
+    # blob (连通域分析)
+    'Blob',
+    'largest_blob',
     # image_matcher (template)
     'ROI',
     'TEMPLATE_SOURCE_RESOLUTION',
