@@ -579,37 +579,72 @@ combat/engine.py::fight() 主循环零覆盖
 （有无 `test_` 函数、是否需要真机、能否 mock），不是文件名。
 只看命名就下结论会把好代码改坏。
 
-**② 建截图 fixture 集**
+**② 建截图 fixture 集** ⏳ **待实机采集（2026-10-12）**
+
+采集脚本已就绪：`tools/diagnostics/capture_fixtures.py`。挂到
+`CombatRecognizer.wait_for_phase` 上，在**每个状态被识别成功的瞬间**截图，
+并写 `manifest.jsonl`（文件名/模式/phase/置信度/分辨率）。
+
+> **2026-10-11 未能采集**：当日掉落已达游戏上限 **500 艘舰船**，
+> 不再有舰船掉落 → `GET_SHIP` 页不出现。
+>
+> **已实测确认这不会导致卡死**：`GET_SHIP` 在转移表里只是**候选之一**
+> （`state.py:234` → `t[RESULT] = list(after_result)`，含 `PROCEED` /
+> `MAP_PAGE` / `GET_SHIP` / `FLAGSHIP_SEVERE_DAMAGE`），掉落满时页面跳过，
+> 引擎认 `PROCEED` 继续。满 500 时关卡选择页会弹一条横幅
+> （「今日已打捞获得500次舰船…」）但**消失很快，无需处理**。
+
+**三个场景必须分开采**（用户指出普通战/活动战、夜战点/普通点确有差异，
+代码核实属实）：
+
+| mode | 计划 | 覆盖路径 | 终态 |
+| --- | --- | --- | --- |
+| `normal` | `5-2炸鱼.yaml`（`night: False`） | 常规战·**昼战** | `MAP_PAGE` |
+| `event` | `H5ACD夜战.yaml` | 活动战·**夜战** | `EVENT_MAP_PAGE` |
+| `campaign` | `5-2炸鱼.yaml` | 战役 SINGLE 模式 | 与 MAP 不同 |
+
+特别注意：H5 三点**进入即夜战、无追击选项**，故 `NIGHT_PROMPT` 在活动战
+场景下**不会出现**，不能指望从 `event` 采集里拿到。
+
+```bash
+cd C:\Users\13930\Desktop\AutoWSGR
+.venv\Scripts\python.exe tools\diagnostics\capture_fixtures.py --mode normal   --rounds 2
+.venv\Scripts\python.exe tools\diagnostics\capture_fixtures.py --mode event    --rounds 3
+.venv\Scripts\python.exe tools\diagnostics\capture_fixtures.py --mode campaign --rounds 2
+```
+
+采完后的三步：① 人工过图确认 phase 标注（采集器只记录**引擎的判断**，
+引擎误判会跟着错）② 移入 `testing/fixtures/screenshots/<mode>/`
+③ 补断言纳入 pytest。
+
+**存放位置**：
 
 ```
 testing/fixtures/screenshots/
-├── combat/
-│   ├── result_page.png          # 战果页 (SS 评级)
-│   ├── exp_settlement.png       # 经验页 (MVP 徽章)
-│   ├── night_prompt.png         # 夜战提示
-│   ├── proceed_dialog.png       # 前进/回港对话框
-│   └── flagship_severe.png      # 旗舰大破
-├── event/
-│   ├── map_20260930.png
-│   └── ...
-└── manifest.yaml                # 每张图的期望识别结果
+├── normal/                # 常规战·昼战
+│   ├── normal_proceed_01.png
+│   ├── normal_result_01.png
+│   └── manifest.jsonl
+├── event/                 # 活动战·夜战
+└── campaign/              # 战役
 ```
 
-```yaml
-# manifest.yaml
-- file: result_page.png
-  screen: MAIN
-  expect_phases: [RESULT]
-  expect_grades: ['SS']
-  note: 舰船立绘遮挡下的战果页 (实机 2026-10-08, 曾误判经验页)
+采集器直接输出 `manifest.jsonl`（每行一条记录），形如：
+
+```json
+{"filename": "event_result_01.png", "mode": "event", "phase": "RESULT",
+ "resolution": [960, 540], "confidence": 0.91,
+ "note": "candidates=['EXP_SETTLEMENT','PROCEED',...]"}
 ```
+
+人工确认后可转成断言：
 
 ```python
-@pytest.mark.parametrize('case', load_manifest(), ids=lambda c: c['file'])
+@pytest.mark.parametrize('case', load_manifest(), ids=lambda c: c['filename'])
 def test_recognizer(case, screen):
     """识别签名回归: 每张 fixture 图必须得到 manifest 里声明的结果。"""
-    result = CombatRecognizer.identify(screen, case['expect_phases'])
-    assert result is not None, f"{case['file']} 应识别为 {case['expect_phases']}"
+    result = CombatRecognizer.identify(screen, [case['phase']])
+    assert result is not None, f"{case['filename']} 应识别为 {case['phase']}"
 ```
 
 **③ 补 `fight()` 主循环测试**
