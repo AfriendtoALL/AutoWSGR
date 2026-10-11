@@ -42,6 +42,48 @@ _log = get_logger('scheduler')
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 故障恢复熔断参数
+#
+# 背景: recover_to_main_or_restart() 定义在 ops/startup.py, 功能完整(含重启
+# 游戏), 但此前 run_daily() 主循环从不调用它 —— 设备掉线 / 游戏闪退 / 网络
+# 断时, 子任务异常被 _run_task 吞成 ACTION_FAILED, 触发器 on_done 只翻
+# _idle=True, 下一轮继续产出任务 → 再失败 → **无限空转, 日志持续写盘**。
+# logs/ 下已有 18+ 个时间戳目录即为此现象留痕。
+#
+# 对标 Alas 的 failure_record 计数熔断: 同一任务失败 >= N 次即升级处置。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_MAX_CONSECUTIVE_FAILURES = 5
+"""连续失败多少次后重启游戏。
+
+取 5 (用户 2026-10-11 指定, 原方案为 3) 的理由: 单次战斗周期约 100s,
+5 次连续失败 ≈ 8~10 分钟才判定「不是偶发抖动」。夜间偶发一次网络抖动
+或一次船坞满处理失败不应触发重启; 而真正的掉线/闪退会持续失败, 8 分钟
+内必然累积到阈值, 仍远快于「空烧一夜」。
+"""
+
+DEFAULT_RECOVERY_COOLDOWN = 60.0
+"""两次重启之间的最小间隔 (秒)。
+
+设备真的掉线时, 每轮都重启会加剧问题 (adb server 被反复拉起、模拟器
+CPU 打满)。给 adb 重连留出窗口。
+"""
+
+_FAILURE_FLAGS: frozenset[ConditionFlag] = frozenset({
+    ConditionFlag.ACTION_FAILED,
+    ConditionFlag.SL,
+})
+"""判定「本轮算失败」的 CombatResult.flag。
+
+- ``ACTION_FAILED``: 子任务异常/空结果, 由 _run_task 捕获后置位
+- ``SL``: 战斗状态机反复无法推进, 引擎已重启过游戏但仍失败
+
+注意 ``DOCK_FULL`` 不算失败 —— 那是正常的资源耗尽信号, 触发器会走解装
+或改派其他任务, 把它计入失败会导致正常挂机被误判为故障并重启游戏。
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Runner 协议
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -134,6 +176,13 @@ class TaskScheduler:
     expedition_interval:
         远征检查间隔 (秒)。默认 ``900`` (15 分钟)。
         设为 ``0`` 或负数则禁用自动远征。
+    max_consecutive_failures:
+        连续多少次「失败轮次」后重启游戏。默认
+        :data:`DEFAULT_MAX_CONSECUTIVE_FAILURES` (5)。设为 ``0`` 或负数
+        则禁用该熔断 (仅保留轻量恢复)。
+    recovery_cooldown:
+        两次重启游戏之间的最小间隔 (秒)。默认
+        :data:`DEFAULT_RECOVERY_COOLDOWN` (60)。
     """
 
     def __init__(
@@ -142,16 +191,23 @@ class TaskScheduler:
         *,
         expedition_interval: float = 900.0,
         idle_sleep: float = 5.0,
+        max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
+        recovery_cooldown: float = DEFAULT_RECOVERY_COOLDOWN,
     ) -> None:
         self._ctx = ctx
         self._expedition_interval = expedition_interval
         self._idle_sleep = idle_sleep
+        self._max_consecutive_failures = max_consecutive_failures
+        self._recovery_cooldown = recovery_cooldown
         self._tasks: list[FightTask] = []
         self._last_expedition_time: float = 0.0
         # 触发器调度 (auto_daily 长期挂机)
         self._triggers: list[Trigger] = []
         self._queue: list[FightTask] = []
         self._last_date: date = date.today()  # noqa: DTZ011  # 跨日按本地墙上时钟 (游戏 0 点刷新)
+        # 故障恢复熔断状态
+        self._consecutive_failures: int = 0
+        self._last_restart_at: float = 0.0
 
     # ── 任务管理 ──
 
@@ -199,7 +255,7 @@ class TaskScheduler:
                 task.times,
             )
             self._ensure_main_page_clean()
-            self._run_task(task)
+            self._run_task(task)  # 返回值在此路径忽略 (顺序执行语义不变)
 
         self._print_summary()
         return list(self._tasks)
@@ -222,8 +278,18 @@ class TaskScheduler:
                 exc,
             )
 
-    def _run_task(self, task: FightTask) -> None:
-        """执行单个任务的全部轮次。"""
+    def _run_task(self, task: FightTask) -> list[CombatResult]:
+        """执行单个任务的全部轮次。
+
+        Returns
+        -------
+        list[CombatResult]
+            本子任务产生的全部结果 (含因异常/空结果补的 ACTION_FAILED)。
+            :meth:`run_daily` 据此判定成败并驱动故障熔断 —— 注意不能只看
+            是否抛异常, 因为子任务异常已在下方被捕获并转成 ACTION_FAILED,
+            异常不会传播到调用方。
+        """
+        all_results: list[CombatResult] = []
         # 统一用 BatchRunnerAdapter 包装: 完整保留 run()→list[CombatResult],
         # 对 run()→单个 CombatResult 规范化为单元素列表, 兼容两类 runner
         # (CampaignRunner / ExerciseRunner 返回 list, 其余返回单个)。
@@ -276,6 +342,7 @@ class TaskScheduler:
                     results = [CombatResult(flag=ConditionFlag.ACTION_FAILED)]
 
                 task.results.extend(results)
+                all_results.extend(results)
 
                 # 本轮全部为「解装完毕的船坞满」→ 未开打, 不占轮次,
                 # on_done 后立即重试 (下轮 run 重新导航进图)
@@ -320,6 +387,8 @@ class TaskScheduler:
                     break
         finally:
             self._ctx.active_fight_tasks -= 1
+
+        return all_results
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # 触发器调度 (auto_daily 长期挂机)
@@ -376,11 +445,14 @@ class TaskScheduler:
             # 取队首执行
             task = self._dequeue()
             if task is not None:
+                results: list[CombatResult] = []
+                crashed = False
                 try:
-                    self._run_task(task)
+                    results = self._run_task(task)
                 except Exception as exc:
                     # _run_task 自身异常 (非 runner.run, 极少见) 兜底: 复位触发器
                     # _idle 避免该触发器卡死不再产出, 继续主循环, 不崩溃脚本。
+                    crashed = True
                     _log.opt(exception=True).error(
                         '[Scheduler] 子任务 {} 执行崩溃, 已跳过: {}',
                         task.name,
@@ -393,6 +465,20 @@ class TaskScheduler:
                             )
                         except Exception:  # noqa: S110  # on_done 回调异常不应影响主循环
                             pass
+
+                # 故障熔断 (T2-1): 「崩溃」与「跑完但结果全是失败」都要计入,
+                # 否则子任务异常被 _run_task 吞成 ACTION_FAILED 后异常不传播,
+                # 主循环会在设备掉线/游戏闪退时无限空转。详见 _handle_failure。
+                if crashed or self._is_failed_round(results):
+                    self._consecutive_failures += 1
+                    self._handle_failure(task, results, crashed)
+                elif self._consecutive_failures:
+                    _log.info(
+                        '[Scheduler] 任务 {} 成功, 连续失败计数归零 ({} → 0)',
+                        task.name,
+                        self._consecutive_failures,
+                    )
+                    self._consecutive_failures = 0
             else:
                 # 队列空:所有触发器暂无任务 (常规战打满 / 只等远征定时) → 挂机等待
                 # 挂机期间顺带做常驻弹窗检查, 保证回到主页面时浮层不残留
@@ -401,6 +487,104 @@ class TaskScheduler:
 
         _log.info('[Scheduler] 收到停止信号, 调度结束')
         self._print_summary()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 故障恢复与熔断 (T2-1)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _is_failed_round(results: list[CombatResult]) -> bool:
+        """本轮是否应计为「失败」。
+
+        判定口径: 无结果 (任务未真正执行) 或**全部**结果都在
+        :data:`_FAILURE_FLAGS` 中。混合结果 (部分成功部分失败) 不计失败 ——
+        例如三连里D 点 SL 但A/C 成功, 该轮仍有产出, 不应触发故障处置。
+        """
+        if not results:
+            return True
+        return all(r.flag in _FAILURE_FLAGS for r in results)
+
+    def _handle_failure(
+        self,
+        task: FightTask,
+        results: list[CombatResult],
+        crashed: bool,
+    ) -> None:
+        """失败处置: 先轻量恢复回主页面, 连续失败达阈值才重启游戏。
+
+        两级处置的原因: 绝大多数失败是**单轮偶发** (一次船坞处理失败、一次
+        页面抖动), 立即重启游戏代价太大; 而设备真掉线时会持续失败, 8~10 分钟
+        内必然累积到阈值 (见 :data:`DEFAULT_MAX_CONSECUTIVE_FAILURES`)。
+        """
+        flags = [r.flag.value if r.flag else 'N/A' for r in results]
+        _log.warning(
+            '[Scheduler] 任务 {} 本轮失败 (连续第 {} 次{}{}): {}',
+            task.name,
+            self._consecutive_failures,
+            f'/{self._max_consecutive_failures}'
+            if self._max_consecutive_failures > 0
+            else '',
+            ', 崩溃' if crashed else '',
+            flags or '无结果',
+        )
+
+        if self._max_consecutive_failures <= 0:
+            # 熔断被禁用: 只做轻量恢复
+            self._try_recover_to_main()
+            return
+
+        if self._consecutive_failures < self._max_consecutive_failures:
+            # 未达阈值 → 轻量恢复 (回主页面), 其失败不致命
+            self._try_recover_to_main()
+            return
+
+        # 达阈值 → 熔断重启, 但受冷却期保护
+        now = time.monotonic()
+        if now - self._last_restart_at < self._recovery_cooldown:
+            _log.error(
+                '[Scheduler] 已连续失败 {} 次, 但距上次重启仅 {:.0f}s '
+                '(冷却期 {:.0f}s), 本轮不再重启',
+                self._consecutive_failures,
+                now - self._last_restart_at,
+                self._recovery_cooldown,
+            )
+            return
+
+        _log.error(
+            '[Scheduler] 连续失败 {} 次达到阈值, 重启游戏 (任务 {})',
+            self._consecutive_failures,
+            task.name,
+        )
+        self._restart_game_safely()
+        # 重启后重新计数, 让新连接有机会从干净状态跑起
+        self._consecutive_failures = 0
+        self._last_restart_at = now
+
+    def _try_recover_to_main(self) -> None:
+        """轻量恢复: 回到主页面 (认不出页面时由被调方重启游戏)。
+
+        自身异常一律吞掉 —— 恢复是「尽力而为」, 失败不该打断主循环。
+        """
+        try:
+            # 函数内 import: ops 依赖 scheduler, 顶层 import 会成环
+            from autowsgr.ops.startup import recover_to_main_or_restart
+
+            recover_to_main_or_restart(self._ctx, self._ctx.config.account.game_app)
+        except Exception as exc:
+            _log.opt(exception=True).warning(
+                '[Scheduler] 轻量恢复失败 (不影响主循环): {}',
+                exc,
+            )
+
+    def _restart_game_safely(self) -> None:
+        """重启游戏 (最重手段), 自身异常不得打断主循环。"""
+        try:
+            from autowsgr.ops import restart_game
+
+            restart_game(self._ctx.ctrl)
+            _log.info('[Scheduler] 游戏已重启')
+        except Exception as exc:
+            _log.opt(exception=True).error('[Scheduler] 重启游戏失败: {}', exc)
 
     def _enqueue(self, task: FightTask) -> None:
         """按 priority 插入队列 (数值小先出;同 priority FIFO)。"""
