@@ -34,6 +34,39 @@ _log_sm = get_logger('combat.engine')  # 状态机转移专用，可单独静默
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 熔断护栏
+#
+# 状态机的三种"卡死"形态，都必须能被确定性终止，不能靠 while 自身的
+# 退出条件碰运气：
+#   1. 识别超时 → 恢复成功 → 继续后又超时  →  恢复死循环
+#   2. 识别始终成功 → 但页面不再推进     →  步数死循环
+#   3. 节点追踪失败 → 反复撤退           →  由步数上限兜底
+#
+# Alas 的对应机制是 device.py 里的 stuck_timer（60s/180s 双计时器，
+# 超时打印完整调用栈再 raise GameStuckError）。此处移植其**思路**：
+#   - ``max_recovery_attempts`` 封住 (1)
+#   - ``max_steps`` 封住 (2)(3)
+#   - 触发时 log 里带上节点/阶段/步数，便于事后定位
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_MAX_RECOVERY_ATTEMPTS = 3
+"""连续恢复的最大次数，超过则判 SL 重开整局。
+
+取 3 的依据：单次超时的典型值是3~30s（START_FIGHT 仅 3s、PROCEED 7.5s、
+RESULT 90s、NIGHT_PROMPT 150s），三次恢复 ≈ 最多约 1 分钟额外开销，
+换��确定退出，代价可接受。
+"""
+
+DEFAULT_MAX_STEPS = 200
+"""单场战斗的最大状态机步数。
+
+正常一次节点战斗约 8~14 步（行军→战况→索敌→阵型→导弹→战斗→夜战→战果→
+经验→掉落→前进）。``selected_nodes`` 有3 点时约 40 步，留 5 倍余量到 200。
+超限说明页面反复横跳或节点判定失效，属异常而非正常流程。
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 战斗引擎
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -50,15 +83,27 @@ class CombatEngine(PhaseHandlersMixin):
         设备控制器 (截图 + 触控)。
     ocr:
         OCR 引擎实例 (阵型识别用)。可选，为 ``None`` 则跳过阵型识别。
+    max_recovery_attempts:
+        单场战斗内允许的连续恢复次数上限，超过则判 SL。默认
+        :data:`DEFAULT_MAX_RECOVERY_ATTEMPTS`。
+    max_steps:
+        单场战斗内允许的状态机步数上限。默认 :data:`DEFAULT_MAX_STEPS`。
     """
 
     def __init__(
         self,
         ctx: GameContext,
+        *,
+        max_recovery_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
+        max_steps: int = DEFAULT_MAX_STEPS,
     ) -> None:
         self._ctx = ctx
         self._device = ctx.ctrl
         self._ocr = ctx.ocr
+
+        # 熔断护栏 (可在构造时覆盖)
+        self._max_recovery_attempts = max_recovery_attempts
+        self._max_steps = max_steps
 
         # 运行时状态 (由 fight() 重置)
         self._plan: CombatPlan = CombatPlan(name='', mode=CombatMode.BATTLE)
@@ -69,6 +114,10 @@ class CombatEngine(PhaseHandlersMixin):
         self._ship_stats: list[ShipDamageState] = [ShipDamageState.NORMAL] * 6
         self._history = CombatHistory()
         self._node_count = 0
+
+        # 熔断计数器 (由 _reset 重置)
+        self._recovery_attempts = 0
+        self._steps = 0
 
         # 节点跟踪器 (仅常规战模式有效，由 fight() 初始化)
         self._tracker: NodeTracker | None = None
@@ -158,6 +207,24 @@ class CombatEngine(PhaseHandlersMixin):
         result = CombatResult(history=self._history)
 
         while True:
+            # ── 护栏 2：步数上限 ──
+            # 封住「识别始终成功但页面不再推进」的死循环（含节点追踪失败
+            # 反复撤退）。正常一次节点战斗 8~14 步，此处默认 200 步余量充足。
+            self._steps += 1
+            if self._steps > self._max_steps:
+                _log.error(
+                    '[Combat] 步数超限 ({} > {}), 判定状态机卡死。'
+                    '当前 phase={} node={} 节点数={} 历史={} —— 判 SL 重开整局',
+                    self._steps,
+                    self._max_steps,
+                    self._phase.name,
+                    self._node,
+                    self._node_count,
+                    self._history,
+                )
+                result.flag = ConditionFlag.SL
+                break
+
             try:
                 decision = self._step()
             except CombatStopRequestedError:
@@ -165,11 +232,39 @@ class CombatEngine(PhaseHandlersMixin):
                 result.flag = ConditionFlag.FIGHT_END
                 break
             except CombatRecognitionTimeoutError as e:
-                _log.warning('[Combat] 状态识别超时: {}', e)
+                _log.warning(
+                    '[Combat] 状态识别超时 (第 {} 次, 步 {}): {}',
+                    self._recovery_attempts + 1,
+                    self._steps,
+                    e,
+                )
+
+                # ── 护栏 1：恢复次数上限 ──
+                # 封住「恢复成功 → 继续 → 又超时」的恢复死循环。此前此处
+                # 是裸 `continue`：若页面稳定停在某个后继态（如 PROCEED
+                # 模板误命中但点击无效），每次都能被认出来，于是无限自我
+                # 循环，永不退出。
+                self._recovery_attempts += 1
+                if self._recovery_attempts > self._max_recovery_attempts:
+                    _log.error(
+                        '[Combat] 连续恢复 {} 次仍未推进 (上限 {}), 放弃本局。'
+                        '当前 phase={} node={} 步={} —— 判 SL 重开整局',
+                        self._recovery_attempts,
+                        self._max_recovery_attempts,
+                        self._phase.name,
+                        self._node,
+                        self._steps,
+                    )
+                    result.flag = ConditionFlag.SL
+                    break
+
                 if self._try_recovery():
                     continue
                 result.flag = ConditionFlag.SL
                 break
+
+            # 本轮成功推进了状态机 → 恢复计数归零
+            self._recovery_attempts = 0
 
             if decision == ConditionFlag.FIGHT_CONTINUE:
                 continue
@@ -184,6 +279,13 @@ class CombatEngine(PhaseHandlersMixin):
 
                 restart_game(self._device)
                 break
+            elif decision == ConditionFlag.SKIP_FIGHT:
+                # 索敌后主动撤退 (节点不在白名单/规则撤退): 不是成功打完,
+                # 不记 OPERATION_SUCCESS (实机 2026-10-08: 撤退轮曾冒充
+                # success)。触发器不计入达标, 会继续产出下一轮。
+                _log.warning('[Combat] 战斗被主动跳过 (撤退), 记 skip fight')
+                result.flag = ConditionFlag.SKIP_FIGHT
+                break
             elif decision == ConditionFlag.FIGHT_END:
                 _log.debug('[Combat] 战斗已结束，日志: {}', self._history)
                 result.flag = ConditionFlag.OPERATION_SUCCESS
@@ -192,9 +294,11 @@ class CombatEngine(PhaseHandlersMixin):
         result.ship_stats = self._ship_stats[:]
         result.node_count = self._node_count
         _log.info(
-            '[Combat] 战斗结束: {} (节点数={})',
+            '[Combat] 战斗结束: {} (节点数={}, 步数={}, 恢复={})',
             result.flag.value,
             result.node_count,
+            self._steps,
+            self._recovery_attempts,
         )
         return result
 
@@ -202,6 +306,16 @@ class CombatEngine(PhaseHandlersMixin):
     # 内部方法
     # ═══════════════════════════════════════════════════════════════════════════
     def _is_map_routing_phase(self, last_phase: CombatPhase) -> bool:
+        """是否处于地图行军/出征过渡阶段 (poll 做节点追踪 + 加速点击)。
+
+        START_FIGHT **必须包含**: 它是「点击开始出征之后、进入战斗之前」
+        的过渡态, 期间 poll 负责节点追踪 —— 若不含, 首次索敌时
+        ``self._node`` 仍是初始 '0', 白名单判定失败会**误撤退**
+        (实机 2026-10-08 18:11: 三连全部「节点=0 撤退」)。
+        该阶段的加速点击位于底部安全带 (见 :attr:`Coords.SPEED_UP_NORMAL`),
+        无可交互元素; 其余时间轴 (FIGHT_PERIOD/NIGHT_PROMPT 等待期) 依然
+        绝不盲点。
+        """
         return (
             last_phase
             in (CombatPhase.PROCEED, CombatPhase.FIGHT_CONDITION, CombatPhase.START_FIGHT)
@@ -214,6 +328,8 @@ class CombatEngine(PhaseHandlersMixin):
         self._node = '0'
         self._node_count = 0
         self._formation_by_rule = None
+        self._recovery_attempts = 0
+        self._steps = 0
 
         # 重置节点追踪器
         if self._tracker is not None:
@@ -249,6 +365,7 @@ class CombatEngine(PhaseHandlersMixin):
         new_phase = self._recognizer.wait_for_phase(
             candidates,
             poll_action=poll_action,
+            allow_event_overlay_anchor=last_phase is not CombatPhase.START_FIGHT,
         )
 
         self._phase = new_phase
@@ -257,8 +374,11 @@ class CombatEngine(PhaseHandlersMixin):
     def _get_poll_action(self, last_phase: CombatPhase) -> Callable[[np.ndarray], None] | None:
         """根据当前状态和模式大类，返回每轮匹配前执行的动作。
 
-        MAP 模式下，地图移动期间执行加速点击、节点追踪、资源弹窗点掉；
-        SINGLE 模式下仅加速点击。
+        MAP 模式下，地图移动/出征过渡期间执行行军加速 (底部安全带)、
+        节点追踪、资源弹窗点掉；SINGLE 模式下仅加速点击。
+        **战斗动画期 (FIGHT_PERIOD/NIGHT_PROMPT 等待) 绝不点击** —— 盲点
+        会把战斗/结算整段点穿 (实机 2026-10-08: 夜战三连被跳过)。结算
+        三层的快速跳过在处理器层 (RESULT 触发) 完成, 位置为底部安全带。
         """
         category = MODE_CATEGORIES.get(self._plan.mode)
         if self._phase is CombatPhase.FIGHT_PERIOD:
@@ -313,6 +433,16 @@ class CombatEngine(PhaseHandlersMixin):
         for phase in resolve_successors(self._plan.transitions, self._phase, self._last_action):
             if phase not in candidates:
                 candidates.append(phase)
+
+        # 结算三层兜底: 快速结算穿行模式下结算页 (战果/经验/掉落) 不在
+        # 后继集, 超时若恰好落在这些页上 (点击尚未推进完), 识别到即可把
+        # 页面交还处理器接着点穿 (转移图仍保留其条目), 不必 SL 重开整局。
+        # 仅 MAP 模式添加: SINGLE (ep=None) 的 RESULT 无转移条目, resume
+        # 会在 resolve_successors KeyError。
+        if MODE_CATEGORIES.get(self._plan.mode) is ModeCategory.MAP:
+            for phase in (CombatPhase.RESULT, CombatPhase.EXP_SETTLEMENT, CombatPhase.GET_SHIP):
+                if phase not in candidates:
+                    candidates.append(phase)
 
         result = self._recognizer.identify_current(screen, candidates)
         if result is not None:
