@@ -112,11 +112,15 @@ class MapPage(SortiePanelMixin, CampaignPanelMixin, DecisivePanelMixin,
 
 ### BattlePreparationPage
 
-通过 Mixin 组合检测 / 补给支援 / 修理 / 换船四大能力。
+通过 Mixin 组合补给支援 / 换船两大能力 (检测与自动修理已于重构中移除)。
+
+.. note::
+    已移除出征准备页的血量识别 / 舰船等级识别 / 舰船种类识别
+    (原 ``DetectionMixin``) 与自动修理 (原 ``RepairMixin``)。血量统一视作
+    正常，修理由用户手动完成。
 
 ```python
-class BattlePreparationPage(DetectionMixin, SupplyMixin, RepairMixin,
-                            FleetChangeMixin, BaseBattlePreparation):
+class BattlePreparationPage(SupplyMixin, FleetChangeMixin, BaseBattlePreparation):
     # ── 页面识别与基础状态 ──
     @staticmethod
     def is_current_page(screen) -> bool: ...
@@ -140,30 +144,30 @@ class BattlePreparationPage(DetectionMixin, SupplyMixin, RepairMixin,
     def select_panel(self, panel: Panel) -> None:
         """切换底部面板标签。"""
 
-    # ── 检测 (DetectionMixin) ──
-    @staticmethod
-    def detect_ship_damage(screen) -> dict[int, ShipDamageState]:
-        """检测 6 个槽位的血量状态 (正常/中破/大破/无舰船)。"""
-    def detect_fleet_info(self, fleet_id: int | None = None) -> FleetInfo:
-        """识别指定舰队详细信息 (等级 + 血量)。
-        fleet_id 为 None 则不切换，直接识别当前舰队。"""
-
     # ── 补给与支援 (SupplyMixin) ──
     @staticmethod
     def is_support_enabled(screen) -> bool:
         """检测战役支援是否启用 (含次数用尽)。"""
     def toggle_battle_support(self) -> None:
         """切换战役支援开关。"""
+    def ensure_auto_supply(self) -> None:
+        """确保游戏内「自动补给」复选框已勾选 (未开则点击开启)。"""
+    def is_fleet_ammo_empty(self) -> bool | None:
+        """检测全舰队弹药是否全空 (True=全空 / False=尚有弹药 / None=无法检测)。"""
+    def supply_all(self) -> None:
+        """脚本手动补给: 打开快速补给面板 → 点击「全部补给」。"""
     def supply(self, ship_ids: list[int] | None = None) -> None:
-        """切换到补给面板并补给指定舰船 (默认全部)。"""
-    def apply_supply(self) -> None:
-        """确保舰队已补给 (自动补给未开则手动补给)。"""
+        """脚本手动补给 (全部); 废弃逐舰点击, 统一调用 ``supply_all``。"""
+    def apply_supply(self, *, mode: str | None = None) -> None:
+        """按需补给——仅当全舰队弹药全空才补给, 不满不补给。
 
-    # ── 修理 (RepairMixin) ──
-    def repair_slots(self, positions: list[int]) -> None:
-        """切换到快速修理面板并修理指定位置。"""
-    def apply_repair(self, strategy: RepairStrategy = SEVERE) -> list[int]:
-        """按策略自动修理，返回实际修理的槽位列表。"""
+        弹药全空后按 ``supply_mode`` 配置/``mode`` 参数决定方式:
+
+        - ``'auto'``   : 勾选游戏内自动补给复选框。
+        - ``'script'`` : 脚本手动点击快速补给 → 全部补给。
+
+        弹药未全空时跳过; 检测失败 (无弹药条) 时回退为直接补给兜底。
+        """
 
     # ── 换船 (FleetChangeMixin) ──
     def change_fleet(self, fleet_id: int | None, ship_names: Sequence[str | None]) -> bool:
@@ -172,13 +176,9 @@ class BattlePreparationPage(DetectionMixin, SupplyMixin, RepairMixin,
 
 **FleetInfo** 数据类:
 
-```python
-@dataclass
-class FleetInfo:
-    fleet_id: int | None       # 舰队编号
-    ship_levels: dict[int, int | None]  # 槽位 → 等级
-    ship_damage: dict[int, ShipDamageState]  # 槽位 → 血量状态
-```
+.. note::
+    已移除 (原 ``DetectionMixin.detect_fleet_info`` 的返回类型)。血量/等级
+    识别已删除，相关字段不再存在；外部如需舰队信息改由配置或手动处理。
 
 **AcquisitionCounts** 数据类:
 

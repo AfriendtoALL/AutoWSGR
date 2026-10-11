@@ -1,12 +1,16 @@
-"""战斗操作函数 — 封装所有战斗中的点击与检测操作。
+"""战斗操作函数 — 封装所有战斗中的点击与识别操作。
 
 包含:
   - 坐标常量 (Coords)
   - UI 点击操作 (click_*)
-  - 血量检测辅助 (check_blood)
-  - 图像检查与识别 (image_exist, click_image, get_ship_drop)
+  - 敌方编成/阵型识别 (get_enemy_info, get_enemy_formation)
+  - 战果评级识别 (detect_result_grade)
+  - 图像检查 (image_exist, click_image)
 
 所有函数为无状态的纯操作，接收必要的对象参数后直接作用。
+
+注: 血量 (HP) 检测、舰船掉落识别已在重构中移除；血量统一视作正常，
+不再做像素级血条探测，也不再按掉落触发每日舰船上限。
 """
 
 from __future__ import annotations
@@ -17,15 +21,12 @@ from typing import TYPE_CHECKING
 from autowsgr.image_resources import TemplateKey, Templates
 from autowsgr.image_resources.keys import RESULT_GRADE_KEYS
 from autowsgr.infra import get_logger
-from autowsgr.types import FightCondition, Formation, RepairMode, ShipDamageState
-from autowsgr.ui.battle.blood import classify_blood
-from autowsgr.vision import ImageChecker, PixelChecker
+from autowsgr.types import FightCondition, Formation
+from autowsgr.vision import ImageChecker
 
 from .recognition import (
-    RESULT_BLOOD_BAR_PROBE,
     recognize_enemy_formation,
     recognize_enemy_ships,
-    recognize_ship_drop,
 )
 from .recognizer import CombatRecognitionTimeoutError
 
@@ -42,10 +43,6 @@ _log = get_logger('combat')
 
 class Coords:
     """战斗中使用的所有坐标常量（相对值）。"""
-
-    # ── 出征 ──
-    START_MARCH = (0.938, 0.926)
-    """开始出征按钮。"""
 
     # ── 索敌阶段 ──
     RETREAT = (0.705, 0.911)
@@ -72,26 +69,33 @@ class Coords:
     CLICK_RESULT = (0.953, 0.954)
     """点击战果页面继续。"""
 
+    # ── 结算盲点穿行 ──
+    SETTLE_SKIP = (0.260, 0.980)
+    """结算三层 (战果/MVP/掉落) 盲点穿行安全位。
+
+    位置依据 (用户指定 2026-10-08, 2026-10-10 修正 x): 底部安全带必须取
+    **左下象限** (x≈0.26) —— 阵型选择界面的 5 个阵型按钮列 (x 0.45~0.97)
+    中「单横阵」一直贴到屏幕底缘, 底缘中部 (x=0.5) 会点中它 (用户
+    2026-10-10 指出)。x=0.26 在全部相关页面 (结算三层/Ex-11 弹层/准备页/
+    行军图/阵型界面) 上均无可交互元素。结算页全屏点击有效 (点掉当前层);
+    对话框遮罩点击无效 —— 但对话框本身是识别候选, 识别到即由处理器接管。
+    """
+
     # ── 加速点击 ──
     SPEED_UP_NORMAL = (0.260, 0.963)
-    """常规战移动加速点击。"""
+    """常规战移动加速点击 (左下安全带)。
 
-    SPEED_UP_BATTLE = (0.396, 0.963)
-    """战役加速点击 / 跳过导弹动画。"""
+    2026-10-10 修正 x: 底缘中部 (x=0.5) 会点中阵型选择界面贴底的
+    「单横阵」按钮 (按钮列 x 0.45~0.97), x 移至 0.26 完全避开右侧
+    功能按钮列 (用户指出)。"""
 
-    # ── 旗舰大破 ──
-    FLAGSHIP_CONFIRM = (0.500, 0.500)
-    """旗舰大破确认（点击图片）。"""
+    SPEED_UP_BATTLE = (0.260, 0.963)
+    """战役加速点击 / 跳过导弹动画 (左下安全带, 同上)。"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 操作函数
 # ═══════════════════════════════════════════════════════════════════════════════
-
-
-def click_start_march(device: AndroidController) -> None:
-    """点击出征按钮。"""
-    device.click(*Coords.START_MARCH)
 
 
 def click_retreat(device: AndroidController) -> None:
@@ -177,8 +181,21 @@ def click_result(device: AndroidController) -> None:
     device.click(*Coords.CLICK_RESULT)
 
 
+def click_settlement_skip(device: AndroidController) -> None:
+    """结算盲点穿行: 点击结算安全位跳过 战果/MVP/掉落 三层。
+
+    由引擎在快速结算模式的等待轮询中持续调用 (见
+    :meth:`CombatEngine._get_poll_action`), 每次轮询截图后、匹配前执行,
+    误触无害 (见 :attr:`Coords.SETTLE_SKIP`)。
+    """
+    device.click(*Coords.SETTLE_SKIP, delay=False)
+
+
 def click_speed_up(device: AndroidController, *, battle_mode: bool = False) -> None:
     """点击加速（移动中或战役中）。
+
+    点击位于底部安全带 (见 :attr:`Coords.SPEED_UP_NORMAL`) —— 行军/战役
+    画面点击任意空白处均加速动画, 该带无可交互元素。
 
     Parameters
     ----------
@@ -201,47 +218,6 @@ def click_skip_missile_animation(device: AndroidController) -> None:
     device.click(*Coords.SPEED_UP_BATTLE, delay=False)
     time.sleep(1)
     device.click(*Coords.SPEED_UP_BATTLE, delay=False)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 血量检测辅助
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def check_blood(
-    ship_stats: list[ShipDamageState],
-    proceed_stop: RepairMode | list[RepairMode],
-) -> bool:
-    """检查血量是否满足继续前进条件。
-
-    Parameters
-    ----------
-    ship_stats:
-        我方血量状态（0-indexed，长度 6）。
-    proceed_stop:
-        停止条件。可以是:
-        - 单个 RepairMode: 所有位置一致的阈值
-        - 列表(6个): 每个位置不同的阈值
-
-        ``RepairMode.moderate_damage`` (1) 表示中破及以上停止,
-        ``RepairMode.severe_damage`` (2) 表示大破及以上停止。
-
-    Returns
-    -------
-    bool
-        ``True`` = 可以继续前进，``False`` = 应当回港。
-    """
-    rules = [proceed_stop] * 6 if isinstance(proceed_stop, RepairMode) else proceed_stop
-
-    for i in range(min(len(ship_stats), len(rules))):
-        stat = ship_stats[i]
-        rule = rules[i]
-
-        if stat == ShipDamageState.NO_SHIP:
-            continue
-        if stat >= rule:
-            return False
-    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -305,27 +281,6 @@ def click_image(device: AndroidController, template_key: TemplateKey, timeout: f
     return False
 
 
-def get_ship_drop(device: AndroidController, ocr: OCREngine) -> str | None:
-    """获取掉落舰船名称。
-
-    Parameters
-    ----------
-    device:
-        设备控制器。
-
-    Returns
-    -------
-    str | None
-        掉落的舰船名称，或 ``None`` 如果未获取到。
-    """
-
-    screen = device.screenshot()
-    result = recognize_ship_drop(screen, ocr)
-    if result.ship_name:
-        _log.info('[Combat] 掉落识别: {} ({})', result.ship_name, result.ship_type or '未知')
-    return result.ship_name
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # 敌方识别函数
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -380,37 +335,6 @@ def detect_result_grade(device: AndroidController) -> str:
         time.sleep(0.25)
         retry += 1
     raise CombatRecognitionTimeoutError('战果等级识别超时: 5 次尝试未识别到有效等级')
-
-
-def detect_ship_stats(
-    device: AndroidController,
-    pre_battle_stats: list[ShipDamageState],
-) -> list[ShipDamageState]:
-    """战斗结算页检测我方舰队血量状态。
-    Parameters
-    ----------
-    pre_battle_stats:
-        战斗开始前的血量状态（0-indexed，长度 6）。
-        若对应位置为 :attr:`ShipDamageState.NO_SHIP`，则无论检测结果如何
-        都保持无舰船状态。
-
-    Returns
-    -------
-    list[ShipDamageState]
-        长度 6 的列表（0-indexed）。
-    """
-    screen = device.screenshot()
-    result: list[ShipDamageState] = [ShipDamageState.NORMAL] * 6
-
-    for slot, (x, y) in RESULT_BLOOD_BAR_PROBE.items():
-        if pre_battle_stats[slot] == ShipDamageState.NO_SHIP:
-            result[slot] = ShipDamageState.NO_SHIP
-            continue
-        pixel = PixelChecker.get_pixel(screen, x, y)
-        result[slot] = classify_blood(pixel)
-
-    _log.info('[Combat] 结算页血量检测: {}', [s.name for s in result])
-    return result
 
 
 def dismiss_resource_confirm(device: AndroidController, screen: ndarray) -> None:

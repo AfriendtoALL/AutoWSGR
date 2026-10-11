@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 from autowsgr.combat import GradeCondition, grade_condition_met
@@ -259,7 +259,7 @@ class NormalFightPlan:
         出击舰队编号。
     target:
         本周期目标出击次数。``None`` 表示无限 (空闲填充, 仅受全局上限
-        ``stop_max_ship`` / ``stop_max_loot`` / ``quick_repair_limit`` 约束)。
+        ``quick_repair_limit`` / ``stop_dock_full`` 约束)。
         dev 的 ``DailyAutomationConfig.normal_fight_tasks`` 只给 plan 名、不给次数,
         所以默认 ``None``, 多个无限 plan 会轮询执行。
     conditions:
@@ -269,6 +269,10 @@ class NormalFightPlan:
         (grade/MVP), 触发器侧谓词才有材料可判。
     completed:
         已成功完成次数 (运行时, 仅日志/有限 plan 的停止判断用)。
+    results:
+        全部尝试场次的结果列表 (含未达标场, 供调用方统计/排查)。
+        触发器模式下调度的战斗不走 ``task.results`` 路径, 此列表是
+        每场 ``CombatResult`` 的唯一记录处。
     """
 
     factory: TaskFactory
@@ -277,6 +281,7 @@ class NormalFightPlan:
     target: int | None = None
     conditions: tuple[GradeCondition, ...] = ()
     completed: int = 0
+    results: list[CombatResult] = field(default_factory=list)
 
 
 class NormalFightTrigger(Trigger):
@@ -294,19 +299,11 @@ class NormalFightTrigger(Trigger):
         priority: int,
         name: str,
         plans: list[NormalFightPlan],
-        stop_max_ship: bool = False,
-        ship_limit: int = 500,
-        stop_max_loot: bool = False,
-        loot_limit: int = 50,
         quick_repair_limit: int | None = None,
         stop_dock_full: bool = True,
     ) -> None:
         super().__init__(priority=priority, name=name)
         self._plans = plans
-        self._stop_max_ship = stop_max_ship
-        self._ship_limit = ship_limit
-        self._stop_max_loot = stop_max_loot
-        self._loot_limit = loot_limit
         self._quick_repair_limit = quick_repair_limit
         self._stop_dock_full = stop_dock_full
         self._current: NormalFightPlan | None = None
@@ -374,10 +371,6 @@ class NormalFightTrigger(Trigger):
 
     def _is_exhausted(self, ctx: GameContext) -> bool:
         """是否本周期常规战已全部完成 / 达上限。"""
-        if self._stop_max_ship and ctx.dropped_ship_count >= self._ship_limit:
-            return True
-        if self._stop_max_loot and ctx.dropped_loot_count >= self._loot_limit:
-            return True
         if (
             self._quick_repair_limit is not None
             and ctx.quick_repair_used >= self._quick_repair_limit
@@ -391,6 +384,8 @@ class NormalFightTrigger(Trigger):
         self._idle = True
         if self._current is None:
             return
+        # 记录全部场次结果 (含未达标场), 供调用方 (如 run_yaml_plan) 统计
+        self._current.results.append(result)
         # 仅成功打完一场才计数 (对齐 classic: SUCCESS/SL 才算);
         # 配置 conditions 的 plan 还须战果全部达标 — 不达标的场次 (如 SL
         # 重开、评级不足) 不计入, 触发器下轮继续产出直到达标次数打满。

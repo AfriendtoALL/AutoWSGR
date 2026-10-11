@@ -3,6 +3,10 @@
     PROCEED → FIGHT_CONDITION → SPOT_ENEMY_SUCCESS → FORMATION
         → FIGHT_PERIOD → NIGHT_PROMPT → RESULT → EXP_SETTLEMENT
         → GET_SHIP → PROCEED → ...
+
+快速模式 (默认, 未开战果采集): RESULT/EXP_SETTLEMENT/GET_SHIP 的转移条目
+保留, 但 RESULT 由处理器以"结算盲点穿行"快速通过 (识别到战果页后持续
+安全位点击, 中间页不识别) — 见 handlers._blind_skip_settlement。
 """
 
 from __future__ import annotations
@@ -199,6 +203,14 @@ def _build_map_transitions(
         CombatPhase.RESULT,
     ]
 
+    # 战斗结束: FIGHT_PERIOD/NIGHT_PROMPT 的后继保持 RESULT 为结算入口
+    # (快速/慢速一致)。结算三层 (战果→MVP→掉落) 的快速跳过在处理器层完成
+    # (handlers._handle_result → _blind_skip_settlement: RESULT 识别到后
+    # 持续安全位点击穿行)。
+    # **状态机等待期间绝不盲点** —— 夜战动画期间点击会把战斗/结算整段
+    # 点穿 (实机 2026-10-10: 夜战三连 A/C/D 进入即夜战、从无追击选项,
+    # 等待期盲点点击导致 PROCEED 对话框被 NIGHT_PROMPT 模板误认, 整场
+    # 夜战被跳过)。
     t[CombatPhase.FIGHT_PERIOD] = [CombatPhase.NIGHT_PROMPT, CombatPhase.RESULT]
     t[CombatPhase.NIGHT_PROMPT] = {
         'yes': [CombatPhase.RESULT],

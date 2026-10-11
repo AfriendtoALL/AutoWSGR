@@ -12,7 +12,6 @@ import time
 from typing import TYPE_CHECKING
 
 from autowsgr.combat.actions import (
-    check_blood,
     click_enter_fight,
     click_fight_condition,
     click_formation,
@@ -21,12 +20,11 @@ from autowsgr.combat.actions import (
     click_proceed,
     click_result,
     click_retreat,
+    click_settlement_skip,
     click_skip_missile_animation,
     detect_result_grade,
-    detect_ship_stats,
     get_enemy_formation,
     get_enemy_info,
-    get_ship_drop,
     image_exist,
 )
 from autowsgr.combat.recognition import detect_mvp
@@ -164,13 +162,21 @@ class PhaseHandlersMixin:
         4. 检查敌舰规则 (enemy_rules)
         5. 根据结果执行: 撤退 / 迂回 / 设置阵型 / 进入战斗
         """
-        # ── 信息采集 ──
-        mode = 'exercise' if self._plan.mode == CombatMode.EXERCISE else 'fight'
-        enemies = get_enemy_info(self._device, mode=mode)
-        enemy_formation = get_enemy_formation(self._device, self._ocr)
-        _log.info('[Combat] 敌方编成: {} 阵型: {}', enemies, enemy_formation)
-
+        # ── 信息采集 (按需) ──
+        # 敌编成识别 + 阵型 OCR 在每个索敌点固定耗时 1~2s, 仅供
+        # enemy_rules / formation_rules 消费; 纯挂机计划 (固定阵型 +
+        # 节点白名单, 无规则) 完全用不上, 跳过采集让索敌决策直达。
+        # (decision 查询是纯查找, 提前无副作用。)
         decision = self._get_current_decision()
+        mode = 'exercise' if self._plan.mode == CombatMode.EXERCISE else 'fight'
+        enemies: dict[str, int] | None = None
+        enemy_formation = ''
+        if decision.enemy_rules:
+            enemies = get_enemy_info(self._device, mode=mode)
+        if decision.formation_rules:
+            enemy_formation = get_enemy_formation(self._device, self._ocr)
+        if enemies is not None or enemy_formation:
+            _log.info('[Combat] 敌方编成: {} 阵型: {}', enemies, enemy_formation)
 
         # 白名单检查
         if not self._plan.is_selected_node(self._node):
@@ -184,7 +190,9 @@ class PhaseHandlersMixin:
                     extra={'reason': '不在预设点'},
                 )
             )
-            return ConditionFlag.FIGHT_END
+            # SKIP_FIGHT 而非 FIGHT_END: 撤退不是成功打完, 不得冒充
+            # OPERATION_SUCCESS (实机 2026-10-08: 撤退轮曾计入成功数)
+            return ConditionFlag.SKIP_FIGHT
 
         # 检查迂回按钮是否可用
         can_detour = image_exist(self._device, TemplateKey.BYPASS, 0.8)
@@ -211,10 +219,11 @@ class PhaseHandlersMixin:
                         event_type=EventType.SPOT_ENEMY,
                         node=self._node,
                         action='撤退',
-                        enemies=enemies.copy(),
+                        enemies=enemies.copy() if enemies is not None else None,
                     )
                 )
-                return ConditionFlag.FIGHT_END
+                # 同白名单撤退: 规则撤退也不得冒充成功打完
+                return ConditionFlag.SKIP_FIGHT
 
             if rule_action.result == RuleResult.DETOUR:
                 if not can_detour:
@@ -248,7 +257,7 @@ class PhaseHandlersMixin:
                     event_type=EventType.SPOT_ENEMY,
                     node=self._node,
                     action='迂回',
-                    enemies=enemies.copy(),
+                    enemies=enemies.copy() if enemies is not None else None,
                 )
             )
             return ConditionFlag.FIGHT_CONTINUE
@@ -269,7 +278,7 @@ class PhaseHandlersMixin:
                 event_type=EventType.SPOT_ENEMY,
                 node=self._node,
                 action='战斗',
-                enemies=enemies.copy(),
+                enemies=enemies.copy() if enemies is not None else None,
             )
         )
         return ConditionFlag.FIGHT_CONTINUE
@@ -385,18 +394,22 @@ class PhaseHandlersMixin:
         return ConditionFlag.FIGHT_CONTINUE
 
     def _handle_result(self) -> ConditionFlag:
-        """处理战果结算 -- 更新血量, 按 ``collect_result_info`` 决定采集与通过速度。
+        """处理战果结算 -- 按 ``collect_result_info`` 决定采集与通过速度。
 
-        快速穿行 (默认): 血量检测 (单次截图, 全局舰队状态同步需要) 后点击
-        穿行, 经验结算页 (:attr:`CombatPhase.EXP_SETTLEMENT`) 作为过渡页直接
-        点过, 不入状态机。
+        重构后不再做像素级血量检测, 我方血量统一视作正常
+        (:attr:`ShipDamageState.NORMAL`)。
+
+        快速穿行 (默认): 结算三层 (战果/经验/掉落) 由
+        :meth:`_blind_skip_settlement` 盲点穿行 —— **仅在 RESULT 已被
+        识别触发后启动**, 战斗动画期绝不点击 (实机 2026-10-10: 等待期
+        盲点把夜战点穿、PROCEED 对话框被误认成夜战提示)。
 
         慢速 (:attr:`CombatPlan.collect_result_info`): RESULT 页停留采集
-        评级/MVP/血量并记录 :class:`FightResult` (供条件战斗按评级判定等),
+        评级/MVP 并记录 :class:`FightResult` (供条件战斗按评级判定等),
         经验页入状态机逐页推进。
         """
-        # ── 血量采集 (快慢模式都做: 单次截图, sync_after_combat 全局依赖) ──
-        self._ship_stats = detect_ship_stats(self._device, self._ship_stats)
+        # 血量检测已移除: 我方血量统一视作正常, 保持引擎默认值 NORMAL*6
+        self._ship_stats = [ShipDamageState.NORMAL] * 6
 
         if self._plan.collect_result_info:
             # ── 慢速: 完整采集 (评级/MVP) ──
@@ -422,12 +435,50 @@ class PhaseHandlersMixin:
             _log.info('[Combat] 战果: {} 节点: {}', fight_result, self._node)
             self._click_result_until_closed(CombatPhase.RESULT)
         else:
-            # ── 快速: 经验页是过渡页, 点击直接穿行 ──
-            self._click_result_until_closed(
-                CombatPhase.RESULT,
-                pass_through=(CombatPhase.EXP_SETTLEMENT,),
-            )
+            # ── 快速: 结算三层盲点穿行 (RESULT 已确认在屏, 点击安全) ──
+            self._blind_skip_settlement()
         return ConditionFlag.FIGHT_CONTINUE
+
+    def _blind_skip_settlement(self, timeout: float = 20.0) -> None:
+        """结算三层 (战果/经验/掉落) 盲点穿行 — 持续点击安全位直到命中落点。
+
+        快速模式专用, **只在 RESULT 已被识别触发后调用**: 此时战斗动画
+        已结束、结算页确认在屏, 全屏点击有效, 每次点击点掉当前层
+        (战果 → 经验 → 掉落)。安全位 (0.5, 0.98) 位于准备页「快速修理」
+        按钮下沿线以下的屏幕底缘带 (用户指定 2026-10-08, 见
+        :attr:`Coords.SETTLE_SKIP`), 全部相关页面上无可交互元素, 连点
+        恒无害; 对话框遮罩上的误触无效且无副作用 —— 命中任何合法落点
+        (前进/回港对话框、旗舰大破、终态页) 即停止, 交回引擎主循环按
+        当前页接管 (PROCEED 决策、终态收尾等)。
+
+        与引擎等待期盲点的边界: FIGHT_PERIOD/NIGHT_PROMPT 等待期**绝不
+        点击** —— 夜战点进入即夜战 (H5-ACD 三点无追击选项), 等待期盲点
+        会把战斗/结算整段点穿; 且 PROCEED 对话框按钮与夜战提示同位
+        (y≈0.648), NIGHT_PROMPT 模板可能误匹配 (实机 2026-10-10 教训)。
+
+        Parameters
+        ----------
+        timeout:
+            穿行总时长上限 (秒)。超时则 warning 后交回引擎主循环 ——
+            RESULT 的错误恢复候选含结算三层, 引擎识别到后会重新调用
+            本处理器接着穿行, 不会丢战斗战果。
+        """
+        stops = [CombatPhase.PROCEED, CombatPhase.FLAGSHIP_SEVERE_DAMAGE]
+        end_phase = self._plan.end_phase
+        if end_phase is not None and end_phase not in stops:
+            stops.append(end_phase)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            click_settlement_skip(self._device)
+            screen = self._device.screenshot()
+            current = self._recognizer.identify_current(screen, stops)
+            if current is not None:
+                _log.debug('[Combat] 结算穿行命中 {}, 交回引擎', current.name)
+                return
+            # 识别不到 = 页面渐变/动画帧, 下一轮继续点 (结算页连点无害)
+            time.sleep(0.2)
+        _log.warning('[Combat] 结算穿行超时 ({:.0f}s), 交回引擎重试', timeout)
 
     def _click_result_until_closed(
         self,
@@ -534,16 +585,16 @@ class PhaseHandlersMixin:
         return ConditionFlag.FIGHT_CONTINUE
 
     def _handle_get_ship(self) -> ConditionFlag:
-        """处理获取舰船。"""
-        ship_name = get_ship_drop(self._device, self._ocr)
-        if ship_name:
-            _log.info('[Combat] 获得舰船: {}', ship_name)
+        """处理获取舰船。
 
+        重构后不再做舰船掉落识别, 仅记录"获得舰船"事件 (记为空名称)。
+        """
+        ship_name = ''
         self._history.add(
             CombatEvent(
                 event_type=EventType.GET_SHIP,
                 node=self._node,
-                result=ship_name or '',
+                result=ship_name,
             )
         )
         self._click_result_until_closed(CombatPhase.GET_SHIP)
@@ -552,14 +603,14 @@ class PhaseHandlersMixin:
     def _handle_proceed(self) -> ConditionFlag:
         """处理继续前进 / 回港决策。
 
-        决策依据:
-        1. 当前节点的 ``proceed`` 配置
-        2. 血量是否满足 ``proceed_stop`` 条件
+        决策依据: 当前节点的 ``proceed`` 配置。
+
+        重构后不再依据血量做前进/回港判断 (血量检测已移除), 仅按节点规划决策。
         """
         self._node_count += 1
         decision = self._get_current_decision()
 
-        should_proceed = decision.proceed and check_blood(self._ship_stats, decision.proceed_stop)
+        should_proceed = decision.proceed
 
         _log.info('[Combat] 继续前进决策: {}', '前进' if should_proceed else '回港')
         click_proceed(self._device, go_forward=should_proceed)

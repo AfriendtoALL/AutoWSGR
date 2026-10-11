@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from autowsgr.combat import CombatMode, CombatPlan, CombatResult
 from autowsgr.combat.engine import run_combat
@@ -22,8 +22,8 @@ from autowsgr.combat.fleet import (
 from autowsgr.infra import ActionFailedError
 from autowsgr.infra.logger import get_logger
 from autowsgr.ops.navigate import goto_page
-from autowsgr.types import ConditionFlag, PageName, RepairMode, ShipDamageState
-from autowsgr.ui import BaseEventPage, BattlePreparationPage, MapPage, MapPanel, RepairStrategy
+from autowsgr.types import ConditionFlag, PageName, ShipDamageState
+from autowsgr.ui import BaseEventPage, BattlePreparationPage, MapPage, MapPanel
 from autowsgr.ui.utils import NavigationError
 
 
@@ -104,13 +104,41 @@ class NormalFightRunner:
             self._map_code = ''
 
         # 仅上一轮 OPERATION_SUCCESS (成功完成战斗, 战后回港必落关卡浮层态)
-        # 才跳过难度/节点检查直接出击; 中途打断/失败一律恢复完整检查 (仅 event 分支使用)
-        self._skip_check = False
+        # 才跳过难度/节点检查直接出击; 中途打断/失败一律恢复完整检查 (仅
+        # event 分支使用)。触发器模式每轮新建 runner 实例, 该前提必须跨
+        # 实例存活 → 落在类级集合 (按关卡身份键控), 实例初始化时查表播种
+        # (实机 2026-10-08: 实例属性每轮归零, 每轮都日志"已关闭残留关卡
+        # 浮层", 弹层复用从未生效)。
+        self._skip_check = self._overlay_key() in NormalFightRunner._overlay_ready
 
         self._results: list[CombatResult] = []
         self._loot_count: int | None = None
         self._ship_acquired_count: int | None = None
         self._fleet_ships: list[Ship] | None = None
+
+    # ── 跨实例弹层复用标记 ──
+
+    _overlay_ready: ClassVar[set[tuple[str | None, str, str | None]]] = set()
+    """「上一场成功完成、战后回港弹层可直接复用再出击」的关卡身份类级集合。
+
+    键 = (活动代号, 地图代码, 入口)。触发器模式每轮经 factory 新建
+    :class:`NormalFightRunner`，实例属性 ``_skip_check`` 会随之归零
+    (实机 2026-10-08: 每轮日志"已关闭残留关卡浮层"，弹层复用从未生效)，
+    故该前提持久化到类级，按关卡身份区分，不跨计划串扰。
+    """
+
+    def _overlay_key(self) -> tuple[str | None, str, str | None]:
+        """当前计划的关卡身份键 (活动代号, 地图代码, 入口)。"""
+        return (self._plan.event_name, self._map_code, self._plan.entrance)
+
+    def _mark_overlay_ready(self, ready: bool) -> None:
+        """同步弹层复用标记到实例属性与类级集合。"""
+        self._skip_check = ready
+        key = self._overlay_key()
+        if ready:
+            NormalFightRunner._overlay_ready.add(key)
+        else:
+            NormalFightRunner._overlay_ready.discard(key)
 
     # ── 公共接口 ──
 
@@ -164,12 +192,12 @@ class NormalFightRunner:
         except Exception:
             # 中途打断 (导航/编队/出征异常): 战后浮层态前提不可知,
             # 下一轮恢复完整检查 (选难度/节点/入口)
-            self._skip_check = False
+            self._mark_overlay_ready(False)
             raise
 
         # 仅成功完成一场战斗才允许下一轮跳过检查 (战后回港必落关卡浮层态);
         # 其余 (DOCK_FULL 解装 / SL / 次数用尽 / 失败) 浮层态前提破坏, 重新检查
-        self._skip_check = result.flag == ConditionFlag.OPERATION_SUCCESS
+        self._mark_overlay_ready(result.flag == ConditionFlag.OPERATION_SUCCESS)
         return result
 
     def run_for_times(
@@ -343,10 +371,29 @@ class NormalFightRunner:
             raise ActionFailedError('地图章节识别/导航失败，已跳过本轮并返回主页面') from e
 
     def _enter_event(self) -> None:
-        """导航到活动地图页面并完成: 难度切换 → 节点选择 → 入口选择 → 出击。
+        """进入本轮出征 — 弹层循环模式 (2026-10-09 用户方案)。
 
-        弹窗关闭由 UI 层 (:class:`BaseEventPage`) 内部处理。
+        三级快速路径, 尽量少点击:
+
+        1. **已在出征准备页** → 直接开始本轮 (零点击);
+        2. **关卡详情弹层在屏** (上轮回港后游戏自动跳回上次选关的详情) →
+           仅点一次「出击准备」进入准备页;
+        3. **其他页面** (脚本首次启动/SL 重启后) → 完整导航:
+           活动地图 → 难度切换 → 节点选择 → 出击。
+
+        路径 1/2 完全跳过活动地图交互 (选难度/选节点), 消除选关点击
+        (0.47, 0.64) 与准备页 4 号位船卡重合的事故根源。
         """
+        screen = self._ctrl.screenshot()
+        if BattlePreparationPage.is_current_page(screen).matched:
+            _log.info('[OPS] 已在出征准备页, 直接开始本轮')
+            return
+        event_page = BaseEventPage(self._ctx, event_name=self._plan.event_name)
+        if event_page.is_fight_ready(screen):
+            _log.info('[OPS] 关卡详情弹层在屏, 直接点击出击准备')
+            event_page.start_fight(self._map_code, self._entrance, skip_check=True)
+            return
+        _log.info('[OPS] 非弹层/准备页状态, 走完整导航选关')
         goto_page(self._ctx, PageName.EVENT_MAP)
         time.sleep(0.25)
         event_page = BaseEventPage(self._ctx, event_name=self._plan.event_name)
@@ -393,28 +440,9 @@ class NormalFightRunner:
         page.apply_supply()
         time.sleep(0.3)
 
-        # 修理策略
-        repair_modes = self._plan.repair_mode
-        if isinstance(repair_modes, list):
-            min_mode = min(m.value for m in repair_modes)
-        else:
-            min_mode = repair_modes.value
-
-        if min_mode <= RepairMode.moderate_damage.value:
-            page.apply_repair(RepairStrategy.MODERATE)
-        elif min_mode <= RepairMode.severe_damage.value:
-            page.apply_repair(RepairStrategy.SEVERE)
-
-        # 检测战前舰队信息 (血量 + 等级)
-        fleet_info = page.detect_fleet_info()
-        ship_stats = [fleet_info.ship_damage.get(i, ShipDamageState.NORMAL) for i in range(6)]
-        if ShipDamageState.SEVERE in ship_stats:
-            _log.error('[OPS] 出征前检测到大破舰船，退出程序')
-            raise ActionFailedError('出征前检测到大破舰船，退出程序')
-        ship_names = resolved_ship_names
-        if ship_names is None:
-            ship_names = self._fleet_selection.primary_names
-        self._fleet_ships = fleet_info.to_ships(ship_names)
+        # 血量检测与自动修理已移除: 我方血量统一视作正常
+        ship_stats = [ShipDamageState.NORMAL] * 6
+        self._fleet_ships = []
 
         # 出征
         page.start_battle()

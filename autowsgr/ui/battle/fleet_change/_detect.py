@@ -18,11 +18,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from autowsgr.constants import SHIPNAMES, normalize_ship_name, ship_name_identity
+from autowsgr.constants import SHIPNAMES, normalize_ship_name
 from autowsgr.infra.logger import get_logger
-from autowsgr.types import ShipDamageState, ShipType
+from autowsgr.types import ShipType
+from autowsgr.ui.battle.ammo import detect_ammo_empty as _detect_ammo_empty
 from autowsgr.ui.battle.base import BaseBattlePreparation
-from autowsgr.ui.battle.detection import DetectionMixin
 from autowsgr.vision.ocr import (
     _fuzzy_match,
     apply_ship_patches,
@@ -63,6 +63,8 @@ class FleetSnapshot:
     """槽位号 (0-5) → 舰种；未请求详细信息时整个字段为 ``None``。"""
     ship_levels: list[int | None] | None = None
     """槽位号 (0-5) → 等级；未请求详细信息时整个字段为 ``None``。"""
+    ammo_empty: list[bool | None] | None = None
+    """槽位号 (0-5) → 弹药是否为空；``True``=空, ``False``=非空, ``None``=无舰船/未检测。"""
 
     @property
     def unknown_slots(self) -> list[int]:
@@ -292,11 +294,10 @@ class FleetDetectMixin(BaseBattlePreparation):
     ) -> FleetSnapshot:
         """使用同一截图识别舰名和槽位占用状态。
 
-        Parameters
-        ----------
-        recognize_ship_details:
-            是否在当前截图额外识别各槽位舰名、舰种和等级。四阶段换船流程
-            不启用该参数，而是通过 ``fill_missing_fleet_snapshot()`` 获取新截图。
+        .. note::
+            重构后不再识别舰种与等级 (原 ``_recognize_fleet_ship_types`` /
+            ``_recognize_fleet_levels`` 已移除)，``recognize_ship_details``
+            仅控制是否在同一截图上补识别未识别到的舰名。
         """
         screen = self._ctrl.screenshot()
         names = self.detect_fleet(
@@ -304,12 +305,8 @@ class FleetDetectMixin(BaseBattlePreparation):
             expected_names=expected_names,
             expected_pool=expected_pool,
         )
-        damage = DetectionMixin.detect_ship_damage(screen)
-        occupied = [
-            names[slot] is not None
-            or damage.get(slot, ShipDamageState.NO_SHIP) != ShipDamageState.NO_SHIP
-            for slot in range(6)
-        ]
+        # 占用状态仅依据 OCR 舰名判断 (血量检测已移除)
+        occupied = [names[slot] is not None for slot in range(6)]
         if recognize_ship_details:
             unknown_name_slots = [
                 slot for slot in range(6) if occupied[slot] and names[slot] is None
@@ -324,20 +321,27 @@ class FleetDetectMixin(BaseBattlePreparation):
                     if names_by_slot.get(slot) is not None:
                         names[slot] = names_by_slot[slot]
 
-            occupied_slots = [slot for slot in range(6) if occupied[slot]]
-            types_by_slot = self._recognize_fleet_ship_types(screen, occupied_slots)
-            levels_by_slot = self._recognize_fleet_levels(screen, occupied_slots)
-            ship_types = [types_by_slot.get(slot) for slot in range(6)]
-            ship_levels = [levels_by_slot.get(slot) for slot in range(6)]
-        else:
-            ship_types = None
-            ship_levels = None
+        # 舰种 / 等级识别已移除: 统一为 None
+        ship_types = None
+        ship_levels = None
+        # 弹药量检测 (确认弹药是否为空, 仅基于像素颜色)
+        ammo_empty = _detect_ammo_empty(screen, occupied=occupied)
         return FleetSnapshot(
             names=names,
             occupied=occupied,
             ship_types=ship_types,
             ship_levels=ship_levels,
+            ammo_empty=ammo_empty,
         )
+
+    def detect_ammo_empty(self) -> list[bool | None]:
+        """确认准备页各舰船槽位弹药是否为空。
+
+        返回长度为 6 的列表: ``True``=弹药为空, ``False``=弹药非空,
+        ``None``=该槽位无舰船。供出征前确认舰队补给状态使用。
+        """
+        screen = self._ctrl.screenshot()
+        return _detect_ammo_empty(screen)
 
     def fill_missing_fleet_snapshot(
         self,
@@ -357,24 +361,8 @@ class FleetDetectMixin(BaseBattlePreparation):
         ship_levels = list(snapshot.ship_levels or [None] * 6)
 
         def required_detail_slots() -> tuple[list[int], list[int]]:
-            if detail_requirements is None:
-                return snapshot.unknown_type_slots, snapshot.unknown_level_slots
-
-            type_slots: list[int] = []
-            level_slots: list[int] = []
-            for slot, (name, occupied) in enumerate(
-                zip(names, snapshot.occupied, strict=True),
-            ):
-                identity = ship_name_identity(name)
-                requirements = detail_requirements.get(identity) if identity is not None else None
-                if not occupied or requirements is None:
-                    continue
-                needs_type, needs_level = requirements
-                if needs_type and ship_types[slot] is None:
-                    type_slots.append(slot)
-                if needs_level and ship_levels[slot] is None:
-                    level_slots.append(slot)
-            return type_slots, level_slots
+            # 舰种/等级识别已移除, 此处仅保留舰名补识别所需的槽位信息。
+            return snapshot.unknown_type_slots, snapshot.unknown_level_slots
 
         type_slots, level_slots = required_detail_slots()
         if not snapshot.unknown_slots and not type_slots and not level_slots:
@@ -392,29 +380,12 @@ class FleetDetectMixin(BaseBattlePreparation):
                 if names_by_slot.get(slot) is not None:
                     names[slot] = names_by_slot[slot]
 
-        # LEVEL4 的舰名可能刚在本次截图中识别成功，需要据此重新确定细节槽位。
-        type_slots, level_slots = required_detail_slots()
-        if type_slots:
-            types_by_slot = self._recognize_fleet_ship_types(
-                screen,
-                type_slots,
-            )
-            for slot in type_slots:
-                if types_by_slot.get(slot) is not None:
-                    ship_types[slot] = types_by_slot[slot]
-
-        if level_slots:
-            levels_by_slot = self._recognize_fleet_levels(
-                screen,
-                level_slots,
-            )
-            for slot in level_slots:
-                if levels_by_slot.get(slot) is not None:
-                    ship_levels[slot] = levels_by_slot[slot]
+        # 舰种 / 等级识别已移除, 不再补识别; ship_types/ship_levels 保持 None。
 
         return FleetSnapshot(
             names=names,
             occupied=list(snapshot.occupied),
             ship_types=ship_types,
             ship_levels=ship_levels,
+            ammo_empty=list(snapshot.ammo_empty or [None] * 6),
         )

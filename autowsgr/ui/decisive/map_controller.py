@@ -22,7 +22,7 @@ import numpy as np
 import autowsgr.ui.decisive.fleet_ocr as _fleet_ocr
 from autowsgr.infra.logger import get_logger
 from autowsgr.types import DecisivePhase, FleetSelection, ShipDamageState
-from autowsgr.ui.battle.preparation import BattlePreparationPage, RepairStrategy
+from autowsgr.ui.battle.preparation import BattlePreparationPage
 from autowsgr.ui.decisive.overlay import (
     ADVANCE_CARD_POSITIONS,
     CLICK_ADVANCE_CONFIRM,
@@ -434,9 +434,13 @@ class DecisiveMapController:
         完整 UI 流程:
 
         1. 进入编队页 (preparation page)
-        2. OCR 识别当前编队成员 + 像素检测血量
+        2. OCR 识别当前编队成员
         3. 进入选船列表扫描所有可用舰船
         4. 返回地图页
+
+        .. note::
+            重构后不再做像素级血量检测, ``damage`` 固定为空字典
+            (所有槽位默认正常)。
 
         对齐 legacy ``_check_fleet``: 同时收集编队成员与列表中的舰船。
 
@@ -446,7 +450,7 @@ class DecisiveMapController:
             ``(fleet, damage, all_ships)``:
 
             - *fleet*: 当前 6 槽位舰船名 (``None`` 为空)
-            - *damage*: 各槽位血量状态
+            - *damage*: 各槽位血量状态 (已移除检测, 固定为空)
             - *all_ships*: 所有可用舰船名 (含编队成员)
         """
         _log.info('[地图控制器] 扫描当前编队与可用舰船')
@@ -457,7 +461,8 @@ class DecisiveMapController:
 
         screen = self._ctrl.screenshot()
         fleet = page.detect_fleet(screen)
-        damage = page.detect_ship_damage(screen)
+        # 血量检测已移除: 不再做像素级血量探测, damage 固定为空
+        damage: dict[int, ShipDamageState] = {}
 
         # 进入选船列表：先确认已离开出征准备页，再进行一次识别
         page.click_ship_slot(0)
@@ -581,8 +586,12 @@ class DecisiveMapController:
         time.sleep(2.0)
 
     def confirm_stage_clear(self) -> list[str]:  # noqa: PLR0912
-        """小关通关后确认弹窗并收集掉落舰船。"""
-        from autowsgr.combat import recognize_ship_drop
+        """小关通关后确认弹窗并关闭掉落弹窗。
+
+        .. note::
+            重构后不再做舰船掉落识别 (``recognize_ship_drop`` 已移除),
+            仅点击关闭掉落/奖励弹窗, 返回的 ``collected`` 固定为空列表。
+        """
         from autowsgr.image_resources import Templates
         from autowsgr.ui.utils import confirm_operation
 
@@ -622,9 +631,7 @@ class DecisiveMapController:
                 if detail is None:
                     break
 
-            ship_drop = recognize_ship_drop(screen, ocr=self._ocr)
-            _log.info(f'[地图控制器] 检测到掉落: {ship_drop.ship_name}({ship_drop.ship_type})')
-            collected.append(ship_drop.ship_name)
+            # 掉落识别已移除: 仅点击关闭掉落弹窗, 不再记录舰名
             self._ctrl.click(0.953, 0.954)
             time.sleep(0.5)
             confirm_operation(self._ctrl, timeout=1.0)
@@ -675,24 +682,14 @@ class DecisiveMapController:
     # ══════════════════════════════════════════════════════════════════════
 
     def repair_at_node(self, repair_level: int) -> list[int]:
-        """进入出征准备页 → 执行快速修理 → 返回地图页。"""
-        _log.info('[地图控制器] 节点间修理 (等级: {})', repair_level)
+        """节点间修理占位方法。
 
-        self._ctrl.click(*CLICK_SORTIE)
-        time.sleep(2.0)
-
-        page = BattlePreparationPage(self._ctx)
-        strategy = RepairStrategy.MODERATE if repair_level <= 1 else RepairStrategy.SEVERE
-        repaired = page.apply_repair(strategy)
-
-        if repaired:
-            _log.info('[地图控制器] 修理完成, 修理槽位: {}', repaired)
-        else:
-            _log.debug('[地图控制器] 无需修理')
-
-        page.go_back()
-        time.sleep(1.0)
-        return repaired
+        .. note::
+            重构后已移除自动修理 (``apply_repair``), 该方法不再执行任何
+            修理操作, 直接返回空列表。修理由用户手动完成。
+        """
+        _log.info('[地图控制器] 节点间修理已禁用 (自动修理已移除)')
+        return []
 
     def change_fleet(
         self,

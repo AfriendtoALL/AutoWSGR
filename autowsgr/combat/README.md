@@ -4,7 +4,6 @@
 
 - actions
     - detect_result_grade
-    - detect_ship_stats
 - engine
     - fight
     - _try_recovery
@@ -25,7 +24,7 @@
 ### 脱机测试（未做）
 
 - recognize_enemy_ships、recognize_enemy_formation 可从截图直接测试
-- detect_result_grade、detect_ship_stats 可从截图直接测试
+- detect_result_grade 可从截图直接测试
 - 决策相关，可通过 mock 数据测试
 
 ### 战役测试（已通过）

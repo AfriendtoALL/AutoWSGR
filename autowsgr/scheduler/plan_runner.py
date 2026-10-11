@@ -117,4 +117,6 @@ def run_yaml_plan(
     finally:
         ctx.stop_event.set()  # 兜底唤醒看门狗, 避免 join 卡死
         watchdog.join()
-    return scheduler.tasks[0].results if scheduler.tasks else []
+    # 触发器模式 (run_daily) 下 scheduler.tasks[0].results 恒为空 — 每场
+    # CombatResult 由 NormalFightTrigger._on_done 记录在 fight_plan.results
+    return fight_plan.results

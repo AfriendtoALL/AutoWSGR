@@ -7,7 +7,6 @@ from autowsgr.ui.battle.preparation import (
     CLICK_PANEL,
     PANEL_PROBE,
     BattlePreparationPage,
-    FleetInfo,
     Panel,
     RepairStrategy,
 )
@@ -17,7 +16,6 @@ __all__ = [
     'CLICK_PANEL',
     'PANEL_PROBE',
     'BattlePreparationPage',
-    'FleetInfo',
     'Panel',
     'RepairStrategy',
 ]

@@ -1,25 +1,22 @@
-"""战斗识别 — DLL 舰类识别 + OCR 阵型/掉落识别。
+"""战斗识别 — DLL 舰类识别 + OCR 阵型识别。
 
 包含核心识别函数:
 
 - :func:`recognize_enemy_ships` — 6 张缩略图 → DLL → 舰类计数
 - :func:`recognize_enemy_formation` — OCR 识别阵型文字
-- :func:`recognize_ship_drop` — OCR 识别掉落舰船名称和类型
 
 这些函数由 :mod:`~autowsgr.combat.actions` 中的高级接口调用。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
 
 from autowsgr.infra.logger import get_logger
-from autowsgr.vision import ROI, ApiDll, PixelChecker, get_api_dll
-from autowsgr.vision.pixel import MatchStrategy, PixelRule, PixelSignature
+from autowsgr.vision import ROI, ApiDll, get_api_dll
 
 
 _log = get_logger('combat.recognition')
@@ -76,21 +73,6 @@ _FORMATION_NAMES: dict[str, str] = {
 
 # 无舰船（空位）的 DLL 返回值
 _NO_SHIP = 'NO'
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 战斗结算页血量探测坐标
-# ═══════════════════════════════════════════════════════════════════════════════
-
-RESULT_BLOOD_BAR_PROBE: dict[int, tuple[float, float]] = {
-    0: (60 / 960, 142 / 540),
-    1: (60 / 960, 217 / 540),
-    2: (60 / 960, 292 / 540),
-    3: (60 / 960, 367 / 540),
-    4: (60 / 960, 442 / 540),
-    5: (60 / 960, 517 / 540),
-}
-"""战斗结算页 6 个舰船血条探测点 (0-indexed)。归一化坐标：原始绝对坐标 (60, y) 基于 960x540。"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -210,105 +192,6 @@ def recognize_enemy_formation(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 舰船掉落识别
-# ═══════════════════════════════════════════════════════════════════════════════
-
-SHIP_DROP_PAGE_SIGNATURE = PixelSignature(
-    name='ship_drop_page',
-    strategy=MatchStrategy.ALL,
-    rules=[
-        PixelRule.of(0.0500, 0.9500, (20, 40, 68), tolerance=15.0),
-        PixelRule.of(0.9500, 0.9500, (12, 35, 60), tolerance=15.0),
-        PixelRule.of(0.9070, 0.1569, (16, 26, 46), tolerance=15.0),
-        PixelRule.of(0.8906, 0.0972, (20, 26, 45), tolerance=15.0),
-        PixelRule.of(0.8016, 0.2361, (33, 82, 125), tolerance=30.0),
-        PixelRule.of(0.8300, 0.3000, (253, 236, 166), tolerance=15.0),
-        PixelRule.of(0.8719, 0.2333, (23, 41, 67), tolerance=15.0),
-        PixelRule.of(0.8109, 0.2681, (36, 58, 72), tolerance=30.0),
-    ],
-)
-"""舰船掉落页面像素签名。"""
-
-# 旋转裁切区域 (左下角, 右上角, 旋转角度)
-_SHIP_NAME_CROP = (0.754, 0.268, 0.983, 0.009, 25)
-"""舰名 OCR 裁切参数 (bl_x, bl_y, tr_x, tr_y, angle)。"""
-
-_SHIP_TYPE_CROP = (0.79, 0.29, 0.95, 0.1, 25)
-"""舰种 OCR 裁切参数 (bl_x, bl_y, tr_x, tr_y, angle)。"""
-
-# 画面中显示的舰种全称 -> 标准中文短名
-_SHIP_TYPE_DISPLAY_MAP: dict[str, str] = {
-    '航空母舰': '航母',
-    '轻型航母': '轻母',
-    '装甲航母': '装母',
-    '战列舰': '战列',
-    '航空战列舰': '航战',
-    '战列巡洋舰': '战巡',
-    '重巡洋舰': '重巡',
-    '航空巡洋舰': '航巡',
-    '雷击巡洋舰': '雷巡',
-    '轻巡洋舰': '轻巡',
-    '重炮舰': '重炮',
-    '驱逐舰': '驱逐',
-    '导弹潜艇': '导潜',
-    '潜艇': '潜艇',
-    '炮击潜艇': '炮潜',
-    '补给舰': '补给',
-    '导弹驱逐舰': '导驱',
-    '防空驱逐舰': '防驱',
-    '导弹巡洋舰': '导巡',
-    '防空巡洋舰': '防巡',
-    '大型巡洋舰': '大巡',
-    '导弹战列舰': '导战',
-}
-
-
-@dataclass(frozen=True, slots=True)
-class ShipDropResult:
-    """舰船掉落识别结果。"""
-
-    ship_name: str | None
-    """匹配到的舰船名，识别失败时为 None。"""
-    ship_type: str | None
-    """舰种显示名称 (如 '驱逐舰')，识别失败时为 None。"""
-
-
-def recognize_ship_drop(
-    screen: np.ndarray,
-    ocr: OCREngine,
-) -> ShipDropResult:
-    """识别舰船掉落页面的舰名和舰种。
-
-    对截图中斜置的舰名和舰种文字区域进行旋转裁切后 OCR 识别。
-    舰名通过模糊匹配校正，舰种直接读取。
-
-    Parameters
-    ----------
-    screen:
-        舰船掉落页面截图 (HxWx3, RGB)。
-    ocr:
-        OCR 引擎实例。
-
-    Returns
-    -------
-    ShipDropResult
-        包含舰名和舰种的识别结果。
-    """
-    # 裁切舰名区域
-    name_img = PixelChecker.crop_rotated(screen, *_SHIP_NAME_CROP)
-    ship_name = ocr.recognize_ship_name(name_img)
-    _log.debug('[识别] 掉落舰名: {}', ship_name or '未识别')
-
-    # 裁切舰种区域
-    type_img = PixelChecker.crop_rotated(screen, *_SHIP_TYPE_CROP)
-    type_result = ocr.recognize_single(type_img)
-    ship_type = type_result.text.strip() or None
-    _log.debug('[识别] 掉落舰种: {}', ship_type or '未识别')
-
-    return ShipDropResult(ship_name=ship_name, ship_type=ship_type)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # MVP 识别
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -366,8 +249,3 @@ def detect_mvp(
     slot = best_slot + 1  # 1-indexed
     _log.info('[识别] MVP 位置: {} (conf={:.3f})', slot, detail.confidence)
     return slot
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 回调工厂
-# ═══════════════════════════════════════════════════════════════════════════════

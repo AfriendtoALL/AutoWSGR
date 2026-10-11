@@ -193,9 +193,9 @@ def build_daily_plan(
     if _bath_repair_starved_by_normal_fight(cfg):
         _log.warning(
             '[daily] 已启用浴室修理, 但存在无限常规战 (times 未设置) 且未开启任何'
-            '停止上限 (stop_max_ship / stop_max_loot / quick_repair_limit)。'
+            '停止上限 (quick_repair_limit)。'
             '常规战会持续抢占浴室修理, 后者将永远不会执行。请为常规战设置 times '
-            '或开启任一停止上限。',
+            '或开启 quick_repair_limit 上限。',
         )
 
     if not scheduler._triggers:
@@ -206,7 +206,7 @@ def _bath_repair_starved_by_normal_fight(cfg: DailyAutomationConfig) -> bool:
     """无限常规战是否会持续抢占浴室修理、致其永不执行。
 
     条件: 启用浴室修理 + 启用常规战 + 存在 ``times=None`` 的常规战任务 +
-    三个停止上限 (stop_max_ship / stop_max_loot / quick_repair_limit) 全关。
+    停止上限 (quick_repair_limit) 全关。
     抽成纯函数便于单测。
     """
     return (
@@ -214,7 +214,7 @@ def _bath_repair_starved_by_normal_fight(cfg: DailyAutomationConfig) -> bool:
         and cfg.auto_normal_fight
         and bool(cfg.normal_fight_tasks)
         and any(task.times is None for task in cfg.normal_fight_tasks)
-        and not (cfg.stop_max_ship or cfg.stop_max_loot or cfg.quick_repair_limit)
+        and not cfg.quick_repair_limit
     )
 
 
@@ -267,8 +267,6 @@ def _register_normal_fight(
             priority=PRIO_NORMAL_FIGHT,
             name='常规战',
             plans=plans,
-            stop_max_ship=cfg.stop_max_ship,
-            stop_max_loot=cfg.stop_max_loot,
             quick_repair_limit=cfg.quick_repair_limit,
         ),
     )

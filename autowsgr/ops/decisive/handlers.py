@@ -30,7 +30,6 @@ from autowsgr.types import (
     FleetSelection,
     ShipDamageState,
 )
-from autowsgr.ui import RepairStrategy
 from autowsgr.ui.decisive import DecisiveBattlePreparationPage
 
 
@@ -334,8 +333,9 @@ class DecisivePhaseHandlers(DecisiveBase):
         # 对齐 legacy: if fleet.empty() and not is_begin(): _check_fleet()
         if self._resume_mode:
             _log.info('[决战] 恢复模式: 扫描当前舰队')
-            fleet, damage, all_ships = self._map.check_fleet()
-            self._state.ship_stats = [damage.get(i, ShipDamageState.NORMAL) for i in range(6)]
+            fleet, _, all_ships = self._map.check_fleet()
+            # 血量检测已移除: 我方血量统一视作正常
+            self._state.ship_stats = [ShipDamageState.NORMAL] * 6
             self._state.ships = all_ships
             # 将编队成员写入 state.fleet[1:]
             for i, name in enumerate(fleet):
@@ -361,14 +361,8 @@ class DecisivePhaseHandlers(DecisiveBase):
         else:
             self._state.fleet = best_fleet
 
-        strategy = (
-            RepairStrategy.MODERATE if self._config.repair_level <= 1 else RepairStrategy.SEVERE
-        )
-        page.apply_repair(strategy, repair_manually=not self._config.use_quick_repair)
-
-        screen = self._ctrl.screenshot()
-        damage = page.detect_ship_damage(screen)
-        self._state.ship_stats = [damage.get(i, ShipDamageState.NORMAL) for i in range(6)]
+        # 自动修理 / 血量检测已移除: 我方血量统一视作正常
+        self._state.ship_stats = [ShipDamageState.NORMAL] * 6
         self._sync_ship_states()
 
         page.start_battle()

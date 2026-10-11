@@ -316,6 +316,8 @@ class BaseEventPage:
             raise ValueError('20260930 活动 map 请使用纯数字，不支持 α/β 入口')
         # map 为 H1, E1 等
         self._dismiss_quiz()
+        from autowsgr.ui.battle.preparation import BattlePreparationPage
+
         if not skip_check:
             if (
                 len(map) != 2
@@ -327,13 +329,18 @@ class BaseEventPage:
             if entrance not in ('alpha', 'beta', None):
                 raise ValueError(f'无效的入口标识: {entrance}')
             difficulty, node_id = map[0], int(map[1])
-            self.ensure_no_overlay()
-            self._change_difficulty(difficulty)
-            self._enter_node(node_id)
-            if entrance is not None:
-                self._select_entrance(entrance)
-
-        from autowsgr.ui.battle.preparation import BattlePreparationPage
+            # 守卫 (2026-10-08 卸船事故): 异常残留可能停在出征准备页, 此时
+            # _enter_node 的节点点击 (0.47, 0.64) 与准备页布局的 **4 号位
+            # 船卡** 位置重合 —— 点中船卡弹出舰船菜单, 后续点击可能命中
+            # 「卸下」 (实机目击: 4/5/6 号位三艘船被依次卸下)。检测到已在
+            # 准备页则跳过选关, 由下方「出击准备」按钮点击自然接管。
+            if BattlePreparationPage.is_current_page(self._ctrl.screenshot()).matched:
+                _log.warning('[UI] 活动地图: 当前已在出征准备页, 跳过选关直接出击')
+            else:
+                self._change_difficulty(difficulty)
+                self._enter_node(node_id)
+                if entrance is not None:
+                    self._select_entrance(entrance)
 
         # 优先点击模板匹配位置 (跨活动布局变化免疫), 匹配失败回退固定坐标
         screen = self._ctrl.screenshot()
@@ -400,28 +407,15 @@ class BaseEventPage:
             return 'H'
         return None
 
-    def ensure_no_overlay(self) -> None:
-        """确保活动地图页处于干净态 (无关卡详情浮层)。
+    def is_fight_ready(self, screen: np.ndarray | None = None) -> bool:
+        """关卡详情弹层是否在屏 (「出击准备」按钮可见)。
 
-        战斗回港后, 活动页常直接落在关卡详情浮层态 (战后 UI 流转跳过出征
-        准备页直接回浮层)。浮层是模态, 会拦截难度切换/节点选择的点击, 需先
-        关闭才能继续选关。
-
-        判定与清理: **出击按钮可见 = 浮层在** (模态浮层在按钮必在) → 点红色
-        X 关闭, 以按钮消失确认; 按钮不可见 → 已是干净态, 直接返回。
+        供弹层循环模式使用: 上轮回港后游戏自动跳回上次选关的详情弹层,
+        弹层在屏时直接点击「出击准备」进入出征准备页, 无需任何选关交互。
         """
-        self._dismiss_quiz()
-        screen = self._ctrl.screenshot()
-        if self._fight_button_detail(screen) is None:
-            return
-        for _ in range(3):
-            self._ctrl.click(*CLICK_CLOSE_NODE_OVERLAY)
-            time.sleep(0.6)
+        if screen is None:
             screen = self._ctrl.screenshot()
-            if self._fight_button_detail(screen) is None:
-                _log.info('[UI] 活动地图: 已关闭残留关卡浮层')
-                return
-        _log.warning('[UI] 活动地图: 关卡浮层点击 3 次未关闭')
+        return self._fight_button_detail(screen) is not None
 
     def _change_difficulty(self, target: str) -> None:
         """切换难度到目标。

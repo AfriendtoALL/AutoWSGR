@@ -23,7 +23,6 @@ from autowsgr.ui import (
     BattlePreparationPage,
     MapPage,
     NavigationError,
-    RepairStrategy,
     wait_leave_page,
 )
 from autowsgr.ui.battle.base import BaseBattlePreparation
@@ -235,7 +234,11 @@ class CampaignRunner:
     # ── 出征准备 ──
 
     def _prepare_for_battle(self) -> tuple[list[ShipDamageState], bool]:
-        """出征准备: 修理、出征，并确认离开准备页面。
+        """出征准备: 出征，并确认离开准备页面。
+
+        .. note::
+            重构后不再做战前血量/等级识别与自动修理 (血量统一视作正常,
+            修理由用户手动完成), ``ship_stats`` 固定为全正常。
 
         点击出征后通过 ``wait_leave_page`` 确认离开；若超时则重试一次。
         两次均失败视为战役次数用尽。
@@ -254,16 +257,9 @@ class CampaignRunner:
         if da is not None and da.auto_set_support:
             ensure_battle_support(self._ctx, enabled=True)
 
-        # 修理策略
-        if self._repair_mode == RepairMode.moderate_damage:
-            page.apply_repair(RepairStrategy.MODERATE)
-        elif self._repair_mode == RepairMode.severe_damage:
-            page.apply_repair(RepairStrategy.SEVERE)
-
-        # 检测战前舰队信息 (血量 + 等级)
-        fleet_info = page.detect_fleet_info()
-        ship_stats = [fleet_info.ship_damage.get(i, ShipDamageState.NORMAL) for i in range(6)]
-        self._fleet_ships = fleet_info.to_ships()
+        # 血量检测与自动修理已移除: 我方血量统一视作正常
+        ship_stats = [ShipDamageState.NORMAL] * 6
+        self._fleet_ships = []
 
         # 出征 + 确认离开
         left = self._start_battle_with_retry(page)

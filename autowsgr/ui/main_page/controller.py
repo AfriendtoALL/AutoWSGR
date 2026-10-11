@@ -97,14 +97,16 @@ class MainPage:
 
         参考 :class:`~autowsgr.ui.event.event_page.BaseEventPage` 模式，
         将浮层 (新闻公告 / 每日签到 / 活动预约 / 提督信息) 也识别为主页面。
-        基础模板用更高阈值 (0.95) 抑制动态背景误命中, 浮层模板 0.85。
+        基础模板用更高阈值 (0.93) 抑制动态背景误命中, 浮层模板 0.85。
+        (0.95 → 0.93: scrcpy 有损视频流的实时帧置信度实测 0.945~0.949,
+        0.95 阈值会导致实机运行时主页面永远无法识别; adb 截图基准则为 0.9997。)
 
         返回带置信度的 :class:`PageMatch` 供候选集排序
         (``PageMatch.__bool__`` 保证旧式真值调用不变)。
         """
         page = Templates.MainPage
         name = PageName.MAIN.value
-        result = ImageChecker.find_template(screen, page.MAIN, confidence=0.95)
+        result = ImageChecker.find_template(screen, page.MAIN, confidence=0.93)
         if result is not None:
             return PageMatch(name=name, matched=True, score=result.confidence)
         overlay = ImageChecker.find_any(

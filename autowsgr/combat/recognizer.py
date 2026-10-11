@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from autowsgr.image_resources import TemplateKey
@@ -73,14 +73,40 @@ class PhaseSignature:
     exclude_template_key: TemplateKey | None = None
 
 
-def _get_event_map_title_templates() -> list[ImageTemplate]:
-    """延迟导入活动地图页面标题图模板。
+def _get_event_map_templates() -> list[ImageTemplate]:
+    """延迟导入活动地图页面识别模板 (标题图 + 出击准备按钮)。
 
     用于识别活动战斗结束回港后的活动地图页 (CombatPhase.EVENT_MAP_PAGE)。
-    """
-    from autowsgr.ui.event.event_page import _get_event_title_templates
 
-    return _get_event_title_templates()
+    回港后活动页有两种形态 (与 :meth:`BaseEventPage.is_current_page` 的
+    锚点逻辑一致), 任一命中即认定战斗已结束回港:
+
+    - **干净态**: 活动标题可见 → 标题图模板命中;
+    - **关卡详情弹层态**: 最终节点结算后游戏直接跳回上次选关的详情弹层
+      (实机 2026-10-08: H5 最终点 D 回港即停在 Ex-11 弹层), 标题被弹层
+      暗化遮罩盖住识别不到 → 以弹层右下角"出击准备"按钮为锚点 (模态弹层
+      在按钮必在, 按钮样式跨活动差异小)。
+
+    ``find_any`` 命中任一即匹配, 两类模板合并传入。
+
+    **按钮锚点的使用边界** (实机 2026-10-08 事故): 出征瞬间出征准备页淡出,
+    底下的关卡弹层会短暂露出 1~2 帧, 按钮锚点同样命中 → 引擎刚启动就误判
+    "已回港"直接结束。故 :meth:`CombatRecognizer.wait_for_phase` 支持
+    ``allow_event_overlay_anchor`` 开关, 由引擎在**行军起始阶段**
+    (``START_FIGHT``) 关闭按钮锚点, 仅战斗流程后段 (RESULT/GET_SHIP/
+    PROCEED 之后, 弹层只可能真实出现在这些阶段) 启用。
+    """
+    from autowsgr.ui.event.event_page import (
+        _get_event_title_templates,
+        _get_fight_button_templates,
+    )
+
+    return [*_get_event_title_templates(), *_get_fight_button_templates()]
+
+
+def _is_event_overlay_button(template: ImageTemplate) -> bool:
+    """判断模板是否为关卡详情弹层的出击准备按钮锚点。"""
+    return template.name.startswith('fight_button')
 
 
 _CHOOSE_FORMATION_SIGNATURE = PixelSignature(
@@ -158,7 +184,7 @@ PHASE_SIGNATURES: dict[CombatPhase, PhaseSignature] = {
     CombatPhase.GET_SHIP: PhaseSignature(
         template_key=TemplateKey.GET_SHIP_OR_ITEM,
         default_timeout=5.0,
-        after_match_delay=1.0,
+        after_match_delay=0.6,
     ),
     CombatPhase.FLAGSHIP_SEVERE_DAMAGE: PhaseSignature(
         template_key=TemplateKey.FLAGSHIP_DAMAGE,
@@ -175,7 +201,7 @@ PHASE_SIGNATURES: dict[CombatPhase, PhaseSignature] = {
     CombatPhase.EVENT_MAP_PAGE: PhaseSignature(
         template_key=None,
         default_timeout=7.5,
-        image_templates=_get_event_map_title_templates(),
+        image_templates=_get_event_map_templates(),
     ),
 }
 
@@ -192,9 +218,6 @@ RESULT_GRADE_KEYS: dict[str, TemplateKey] = {
     'C': TemplateKey.GRADE_C,
     'D': TemplateKey.GRADE_D,
 }
-
-# 向后兼容别名
-RESULT_GRADE_TEMPLATES = {k: v.value for k, v in RESULT_GRADE_KEYS.items()}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -282,6 +305,8 @@ class CombatRecognizer:
         candidates: list[CombatPhase],
         *,
         poll_action: Callable[[np.ndarray], None] | None = None,
+        allow_event_overlay_anchor: bool = True,
+        timeout: float | None = None,
     ) -> CombatPhase:
         """等待候选状态之一出现。
 
@@ -292,7 +317,18 @@ class CombatRecognizer:
         candidates:
             候选状态列表。
         poll_action:
-            每轮匹配前执行的动作（如点击加速、节点追踪等）。
+            每轮匹配前执行的动作（如点击加速、节点追踪、结算盲点穿行等）。
+        allow_event_overlay_anchor:
+            是否允许用关卡详情弹层的"出击准备"按钮识别
+            :attr:`CombatPhase.EVENT_MAP_PAGE`。**出征过渡期必须关闭**:
+            点"开始出征"后出征准备页淡出, 底下弹层短暂露出 1~2 帧, 按钮
+            锚点会误命中导致引擎刚启动就误判回港结束 (实机 2026-10-08)。
+            战斗流程后段 (RESULT/GET_SHIP/PROCEED 之后) 弹层只可能真实
+            出现, 应保持开启以识别 D 点回港弹层态。
+        timeout:
+            总超时覆盖 (秒)。``None`` (默认) 时取候选签名默认超时的最大值。
+            结算盲点穿行等待 (夜战动画 + 结算三层) 时长超过候选默认超时,
+            由引擎传入更长的覆盖值。
 
         Returns
         -------
@@ -309,8 +345,26 @@ class CombatRecognizer:
         phase_sigs: list[tuple[CombatPhase, PhaseSignature]] = []
         for phase in candidates:
             sig = self.get_signature(phase)
+            if (
+                not allow_event_overlay_anchor
+                and phase is CombatPhase.EVENT_MAP_PAGE
+                and sig.image_templates is not None
+            ):
+                # 仅标题锚点: 剔除弹层出击按钮模板 (dataclasses.replace 副本,
+                # 不污染全局签名)
+                sig = replace(
+                    sig,
+                    image_templates=[
+                        t
+                        for t in sig.image_templates
+                        if not _is_event_overlay_button(t)
+                    ],
+                )
             max_timeout = max(max_timeout, sig.default_timeout)
             phase_sigs.append((phase, sig))
+
+        if timeout is not None:
+            max_timeout = timeout
 
         deadline = time.time() + max_timeout
 

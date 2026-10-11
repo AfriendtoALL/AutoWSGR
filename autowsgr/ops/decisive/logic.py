@@ -147,12 +147,13 @@ class DecisiveLogic:
         return ship_count < 1
 
     def should_repair(self) -> bool:
-        """根据修理等级判断是否需要修理。"""
-        if not self.config.use_quick_repair:
-            return False
-        return any(
-            status >= self.config.repair_level for status in self.state.ship_stats if status > 0
-        )
+        """判断是否需要修理。
+
+        .. note::
+            重构后已移除自动修理能力, 该方法固定返回 ``False``。
+            血量不再被识别, ``state.ship_stats`` 恒为正常, 修理由用户手动完成。
+        """
+        return False
 
     def is_stage_end(self, node: str | None = None) -> bool:
         """判断当前节点是否为该小关的终止节点。

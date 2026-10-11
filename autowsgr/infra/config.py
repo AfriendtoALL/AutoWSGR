@@ -235,9 +235,8 @@ class NormalFightTaskConfig(BaseModel):
     times: int | None = None
     """目标出击次数; ``None`` 表示无限 (空闲填充, 仅受全局上限约束)。
 
-    .. note:: ``times=None`` (无限) 且未开启 ``stop_max_ship`` /
-       ``stop_max_loot`` / ``quick_repair_limit`` 任一上限时, 常规战会持续
-       产出任务、永远抢占浴室修理 (优先级更低), 致浴室修理永不执行。
+    .. note:: ``times=None`` (无限) 且未开启 ``quick_repair_limit`` 上限时,
+       常规战会持续产出任务、永远抢占浴室修理 (优先级更低), 致浴室修理永不执行。
     """
 
 
@@ -288,10 +287,6 @@ class DailyAutomationConfig(BaseModel):
     """常规战任务列表; 兼容 classic ``[name, fleet, times]`` 写法 (见下方校验器)。"""
     quick_repair_limit: int | None = None
     """快修消耗上限"""
-    stop_max_ship: bool = False
-    """获取当天上限 500 船后终止"""
-    stop_max_loot: bool = False
-    """获取当天上限 50 胖次后终止"""
 
     @field_validator('normal_fight_tasks', mode='before')
     @classmethod
@@ -438,6 +433,12 @@ class UserConfig(BaseModel):
     # 新版用 operation_delay_min/max 字段, 由 _apply_operation_delay 写回模块
     # 全局 OPERATION_DELAY_MIN/MAX (供 operation_delay() 读取)。
     # check_page 功能已由 launcher.ensure_ready 覆盖。
+    supply_mode: Literal['auto', 'script'] = 'script'
+    """出征前补给方式。
+
+    - ``'auto'``   : 勾选游戏内「自动补给」复选框，由游戏在出击时自动补给。
+    - ``'script'`` : 脚本手动补给 —— 打开「快速补给」面板后点击「全部补给」按钮。
+    """
     operation_delay_min: float = 0.0
     """UI 操作后随机延迟下界 (秒)。兼容层把 classic 的 delay 同时迁为本字段与 _max。"""
     operation_delay_max: float = 0.0

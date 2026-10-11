@@ -92,7 +92,12 @@ class ExerciseRunner:
     # ── 出征准备 ──
 
     def _prepare_for_battle(self) -> list[ShipDamageState]:
-        """在出征准备页面执行舰队选择和修理。"""
+        """在出征准备页面执行舰队选择。
+
+        .. note::
+            重构后不再做战前血量识别 (``detect_ship_damage`` 已移除),
+            ``ship_stats`` 固定为全正常。
+        """
         time.sleep(1.0)
         page = BattlePreparationPage(self._ctx)
 
@@ -100,9 +105,8 @@ class ExerciseRunner:
         page.select_fleet(self._fleet_id)
         time.sleep(0.5)
 
-        screen = self._ctrl.screenshot()
-        damage = page.detect_ship_damage(screen)
-        ship_stats = [damage.get(i, ShipDamageState.NORMAL) for i in range(6)]
+        # 血量识别已移除: 我方血量统一视作正常
+        ship_stats = [ShipDamageState.NORMAL] * 6
 
         # 出征
         page.start_battle()

@@ -117,6 +117,7 @@ class ScrcpyController(AndroidController):
 
         self._device: AdbDevice | None = None
         self._resolution: tuple[int, int] = (0, 0)
+        self._native_resolution: tuple[int, int] = (0, 0)
         self._last_frame: np.ndarray | None = None
 
         # scrcpy 连接状态
@@ -129,6 +130,12 @@ class ScrcpyController(AndroidController):
         self._frame_lock = threading.Lock()
         self._reconnect_lock = threading.Lock()
         self._control_lock = threading.Lock()  # 控制流写串行化
+
+        # 加速通道 (connect() 中初始化; 未连接前为 None)
+        self._nemu: 'NemuIpcCapture | None' = None
+        self._adb_path: str | None = None
+        self._maatouch: 'MaaTouchController | None' = None
+        self._persistent_shell: 'PersistentAdbShell | None' = None
 
     # ── 连接 ──
 
@@ -160,6 +167,10 @@ class ScrcpyController(AndroidController):
         else:
             self._resolution = (960, 540)  # fallback
             _log.warning('[Emulator] 无法获取设备分辨率，使用默认值 960x540')
+        # 记录设备真实分辨率：scrcpy 会把解码帧高度裁剪为 8 的整数倍
+        # （如 960x540 → 960x536），而页面像素签名按真实分辨率标定，
+        # 后续在解码循环中据此把帧高度补齐回真实值。
+        self._native_resolution = self._resolution
 
         # ── 部署并启动 scrcpy-server ──
         self._deploy_server()
@@ -174,6 +185,49 @@ class ScrcpyController(AndroidController):
                 f'scrcpy 视频流未能在 {self._screenshot_timeout}s 内产生首帧'
             )
 
+        # ── 加速通道初始化 (可选, 失败自动回退) ──
+        # nemu_ipc: 直读 MuMu 渲染共享内存 (实测 ~3ms vs 流链路 50-150ms)
+        self._nemu: NemuIpcCapture | None = None
+        try:
+            import os as _os
+            from .nemu_ipc import NemuIpcCapture, detect_mumu_folder
+            folder = detect_mumu_folder()
+            if folder is not None:
+                self._nemu = NemuIpcCapture(folder, self._serial or '', self._resolution)
+                # 顺便锁定 adb.exe (MaaTouch 需要)
+                adb_candidate = _os.path.join(folder, 'nx_main', 'adb.exe')
+                if _os.path.exists(adb_candidate):
+                    self._adb_path = adb_candidate
+        except Exception as exc:
+            self._nemu = None
+            _log.info('[Emulator] nemu_ipc 不可用, 截图继续走 scrcpy 流: {}', exc)
+        # MaaTouch: socket 流注入 (写入即注入 ~0ms, 断连写抛异常可感知)
+        self._maatouch = None
+        try:
+            import os as _os
+            from .maatouch import MaaTouchController
+            local = 'bin/MaaTouch/maatouch'
+            local = local if _os.path.exists(local) else None
+            self._maatouch = MaaTouchController(
+                adb_path=self._adb_path or self._resolve_adb_path() or 'adb',
+                serial=self._serial or '',
+                local_path=local,
+                screen_size=self._resolution,
+            )
+        except Exception as exc:
+            self._maatouch = None
+            _log.info('[Emulator] MaaTouch 不可用, 点击走 persistent/adb: {}', exc)
+        # 常驻 adb shell: 点击免进程开销 (实测提交 ~0ms vs 单次 70ms)
+        self._persistent_shell: PersistentAdbShell | None = None
+        try:
+            from .nemu_ipc import PersistentAdbShell
+            adb_path = self._resolve_adb_path()
+            if adb_path:
+                self._persistent_shell = PersistentAdbShell(adb_path, self._serial or '')
+        except Exception as exc:
+            self._persistent_shell = None
+            _log.info('[Emulator] 常驻 shell 不可用, 点击继续走单次 adb: {}', exc)
+
         _log.info(
             '[Emulator] 已连接设备 (scrcpy): {} ({}x{})',
             self._serial or 'auto',
@@ -183,6 +237,15 @@ class ScrcpyController(AndroidController):
             serial=self._serial or 'auto',
             resolution=self._resolution,
         )
+
+    def _resolve_adb_path(self) -> str | None:
+        """定位 adb.exe。"""
+        import os
+        import shutil
+        found = shutil.which('adb')
+        if found:
+            return found
+        return None
 
     def _connect_adb_device(self, serial: str | None) -> None:
         """通过 adbutils 连接设备。"""
@@ -353,6 +416,20 @@ class ScrcpyController(AndroidController):
                         rgb = frame.to_ndarray(format='rgb24')
                         h, w = rgb.shape[:2]
 
+                        # scrcpy 将帧高度裁剪为 8 的整数倍（960x540 → 960x536），
+                        # 但页面像素签名按设备真实分辨率(960x540)标定。底部补齐到
+                        # 真实高度（边缘复制），避免锚点像素错位；缩放会扭曲投影。
+                        native_h = self._native_resolution[1]
+                        if rgb.shape[0] < native_h:
+                            import numpy as np
+
+                            rgb = np.pad(
+                                rgb,
+                                ((0, native_h - rgb.shape[0]), (0, 0), (0, 0)),
+                                mode='edge',
+                            )
+                            h = native_h
+
                         with self._frame_lock:
                             self._last_frame = rgb
                             if self._resolution != (w, h):
@@ -377,6 +454,26 @@ class ScrcpyController(AndroidController):
     def disconnect(self) -> None:
         serial = self._serial or 'auto'
         self._close_video_channel()
+
+        # 释放加速通道
+        if self._nemu is not None:
+            try:
+                self._nemu.close()
+            except Exception:
+                pass
+            self._nemu = None
+        if self._maatouch is not None:
+            try:
+                self._maatouch.close()
+            except Exception:
+                pass
+            self._maatouch = None
+        if self._persistent_shell is not None:
+            try:
+                self._persistent_shell.close()
+            except Exception:
+                pass
+            self._persistent_shell = None
 
         self._device = None
         self._resolution = (0, 0)
@@ -601,6 +698,19 @@ class ScrcpyController(AndroidController):
     def screenshot(self) -> np.ndarray:
         self._ensure_stream_alive()
 
+        # ── 加速通道: nemu_ipc 共享内存直读 (失败永久降级回流) ──
+        if self._nemu is not None:
+            try:
+                return self._nemu.capture()
+            except Exception as exc:
+                _log.warning(
+                    '[Emulator] nemu_ipc 持续失败, 永久降级回 scrcpy 流: {}', exc)
+                try:
+                    self._nemu.close()
+                except Exception:
+                    pass
+                self._nemu = None
+
         start = time.monotonic()
         while True:
             with self._frame_lock:
@@ -629,6 +739,47 @@ class ScrcpyController(AndroidController):
             time.sleep(0.01)
 
     # ── 触控 ──
+    # 注意：MuMu 12 等模拟器内置了自己的 scrcpy 协议服务（占用 "scrcpy" abstract
+    # socket，且不会真正执行我们部署的 server），其实现支持 INJECT_KEYCODE 但
+    # 不支持 INJECT_TOUCH_EVENT（v1/v2 格式均无效，实测 2026-10-08）。
+    # 因此触控统一走 adb `input` 命令（约 50ms 开销，稳定性已实测），
+    # 截图（视频流）与按键（keycode）仍走 scrcpy 通道保持低延迟。
+
+    def _adb_input(self, args: list[str], timeout: float = 10.0) -> None:
+        """注入触控事件。
+
+        优先级: MaaTouch (socket 流注入, 仅 tap) → 常驻 shell 会话 → 单次
+        adb input。每级失败自动降级到下一级。
+        """
+        if self._maatouch is not None and args[0] == 'tap':
+            try:
+                self._maatouch.click(int(args[1]), int(args[2]))
+                return
+            except Exception as exc:
+                _log.warning(
+                    '[Emulator] MaaTouch 持续失败, 降级 persistent/adb: {}', exc)
+                try:
+                    self._maatouch.close()
+                except Exception:
+                    pass
+                self._maatouch = None
+        if self._persistent_shell is not None:
+            try:
+                self._persistent_shell.run(*args)
+                return
+            except Exception as exc:
+                _log.warning('[Emulator] 常驻 shell 持续失败, 回退单次 adb: {}', exc)
+                try:
+                    self._persistent_shell.close()
+                except Exception:
+                    pass
+                self._persistent_shell = None
+        dev = self._require_device()
+        try:
+            dev.shell(['input', *args], timeout=timeout)
+        except Exception as exc:
+            _log.warning('[Emulator] adb input {} 失败: {}', args, exc)
+
     # 引入一个开关，当参数为：click(x, y, delay=False) 时关闭延迟，该方法默认打开全局延迟，全局延迟可以在 config.py 内设置
     def click(self, x: float, y: float, *, delay: bool = True) -> None:
         w, h = self._resolution
@@ -643,9 +794,7 @@ class ScrcpyController(AndroidController):
             h,
             caller_info(),
         )
-        self._inject_touch(_ACTION_DOWN, x, y, pressure=1.0)
-        time.sleep(_MIN_GESTURE_INTERVAL)  # DOWN/UP 间留出最小间隔，防止游戏来不及处理
-        self._inject_touch(_ACTION_UP, x, y, pressure=0.0)
+        self._adb_input(['tap', str(px), str(py)])
 
         if delay:  # True 才走延迟
             time.sleep(operation_delay())
@@ -676,22 +825,8 @@ class ScrcpyController(AndroidController):
             ms,
             caller_info(),
         )
-        # 按下
-        self._inject_touch(_ACTION_DOWN, x1, y1, pressure=1.0)
-        time.sleep(_MIN_GESTURE_INTERVAL)  # DOWN 后留出最小间隔，再开始 MOVE 插值
-        # 在 duration 内插值若干 MOVE 事件，保证流畅滑动
-        steps = max(1, ms // 16)  # ~60fps，每步约 16ms
-        step_ms = ms / steps
-        for i in range(1, steps + 1):
-            t = i / steps
-            cx = x1 + (x2 - x1) * t
-            cy = y1 + (y2 - y1) * t
-            self._inject_touch(_ACTION_MOVE, cx, cy, pressure=1.0)
-            # 每步之间的间隔就是 swipe 本身的节奏（约 16ms/步），
-            # 已经足够避免连续发送过快；max() 仅在极短 duration 下兜底。
-            time.sleep(max(step_ms / 1000.0, _MIN_GESTURE_INTERVAL))
-        # 抬起
-        self._inject_touch(_ACTION_UP, x2, y2, pressure=0.0)
+        # adb input swipe 由系统内部插值，节奏平滑
+        self._adb_input(['swipe', str(px1), str(py1), str(px2), str(py2), str(ms)])
 
         # 增加延迟，改动同 click_delay
         if delay:  # True 才走延迟
@@ -730,10 +865,8 @@ class ScrcpyController(AndroidController):
             ms,
             caller_info(),
         )
-        # 按下后保持不动，再抬起（与 input swipe 同点等价）
-        self._inject_touch(_ACTION_DOWN, x, y, pressure=1.0)
-        time.sleep(duration)
-        self._inject_touch(_ACTION_UP, x, y, pressure=0.0)
+        # 长按 = 同点 swipe（系统按 duration 保持按压）
+        self._adb_input(['swipe', str(px), str(py), str(px), str(py), str(ms)])
 
     # ── 按键 ──
     def key_event(self, key_code: int, *, delay: bool = True) -> None:

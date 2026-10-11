@@ -48,25 +48,38 @@ from autowsgr.ui.battle.fleet_change import FleetChangeMixin
 
 以下对象未导出、无生产调用、无测试引用，也没有兼容说明：
 
-| 模块 | 可删除对象 |
-| --- | --- |
-| `combat/actions.py` | `FLAGSHIP_CONFIRM`、`click_start_march` |
-| `combat/fleet.py` | `NATIVE_FLEET_VESSEL_TYPES` |
-| `combat/recognition.py` | `_SHIP_TYPE_DISPLAY_MAP` |
-| `combat/rules.py` | `_SHIP_TYPE_PATTERN` |
-| `ops/normal_fight.py` | `self._destroy_ship_types` 赋值 |
-| `ops/startup.py` | `_OVERLAY_DISMISS_TIMEOUT`、`_OVERLAY_DISMISS_DELAY` |
-| `emulator/controller/scrcpy.py` | `_TYPE_INJECT_SCROLL_EVENT` |
-| `ui/bath_page/recognition.py` | `_TIME_Y_MIN` |
-| `ui/decisive/fleet_ocr.py` | `_prepare_name_roi` |
-| `ui/decisive/overlay.py` | `CLICK_BUY_EXP`、`CLICK_SKILL`、`is_advance_choice`、`is_confirm_exit` |
-| `ui/main_page/constants.py` | `EVENT_SIDEBAR_BG` |
-| `ui/map/data.py` | `EXPEDITION_IDLE_COLOR`、`SIDEBAR_SCAN_*`、`RIVAL_POSITIONS`、`CLICK_CHALLENGE` |
-| `ui/tabbed_page.py` | `TAB_DARK` |
-| `ui/utils/ship_list.py` | `_center_x` |
-| `vision/ocr_rules.py` | `LEVEL_LABEL_PATTERN` |
-| `server/schemas.py` | `SystemStatusResponse`、`LogMessage`，以及随之失去引用的 `LogLevel` |
-| `server/ws_manager.py` | `send_log`，以及仅由它使用的 `UTC`、`datetime` 导入 |
+> **2026-10-11 已清理** — 下列打勾项已删除，全量测试 1335 passed / 25 skipped。
+> 其中 `_SHIP_TYPE_DISPLAY_MAP` 早已删除（见上文第 3 节）。
+>
+> **一处修正**：原报告把 `scheduler.py::_sync_initial_counts` 也列为死代码
+> （"空 return"），但它有 **6 处测试**在断言其不调用 `ctx.sync_daily_drop_counts`
+> （`testing/ops/test_scheduler_unit.py:390-430`），属**被测试锁定的兼容占位**，
+> 不是死代码，**已保留**。空函数体不等于死代码 —— 判断标准是「无测试引用」。
+
+| 模块 | 可删除对象 | 状态 |
+| --- | --- | --- |
+| `combat/actions.py` | `FLAGSHIP_CONFIRM`、`click_start_march` | ✅ 已删 |
+| `combat/actions.py` | `Coords.START_MARCH`（随 `click_start_march` 变孤儿） | ✅ 已删 |
+| `combat/fleet.py` | `NATIVE_FLEET_VESSEL_TYPES` | ✅ 已删 |
+| `combat/recognition.py` | `_SHIP_TYPE_DISPLAY_MAP` | ✅ 已删 |
+| `combat/rules.py` | `_SHIP_TYPE_PATTERN` | ✅ 已删 |
+| `combat/recognizer.py` | `RESULT_GRADE_TEMPLATES`（自称向后兼容别名，实测零消费） | ✅ 已删 |
+| `scheduler/scheduler.py` | `_disable_normal_fight` | ✅ 已删 |
+| `combat/node_tracker.py` | `NodeTracker.track()`（零调用） | ⬜ 待删 |
+| `combat/plan.py` | `proceed_stop`（配置项，引擎全域零消费但用户文档已承诺） | ⬜ 待定 |
+| `ops/normal_fight.py` | `self._destroy_ship_types` 赋值 | ⬜ 待删 |
+| `ops/startup.py` | `_OVERLAY_DISMISS_TIMEOUT`、`_OVERLAY_DISMISS_DELAY` | ⬜ 待删 |
+| `emulator/controller/scrcpy.py` | `_TYPE_INJECT_SCROLL_EVENT` | ⬜ 待删 |
+| `ui/bath_page/recognition.py` | `_TIME_Y_MIN` | ⬜ 待删 |
+| `ui/decisive/fleet_ocr.py` | `_prepare_name_roi` | ⬜ 待删 |
+| `ui/decisive/overlay.py` | `CLICK_BUY_EXP`、`CLICK_SKILL`、`is_advance_choice`、`is_confirm_exit` | ⬜ 待删 |
+| `ui/main_page/constants.py` | `EVENT_SIDEBAR_BG` | ⬜ 待删 |
+| `ui/map/data.py` | `EXPEDITION_IDLE_COLOR`、`SIDEBAR_SCAN_*`、`RIVAL_POSITIONS`、`CLICK_CHALLENGE` | ⬜ 待删 |
+| `ui/tabbed_page.py` | `TAB_DARK` | ⬜ 待删 |
+| `ui/utils/ship_list.py` | `_center_x` | ⬜ 待删 |
+| `vision/ocr_rules.py` | `LEVEL_LABEL_PATTERN` | ⬜ 待删 |
+| `server/schemas.py` | `SystemStatusResponse`、`LogMessage`，以及随之失去引用的 `LogLevel` | ⬜ 待删 |
+| `server/ws_manager.py` | `send_log`，以及仅由它使用的 `UTC`、`datetime` 导入 | ⬜ 待删 |
 | `image_resources/_lazy.py` | 未被读取的 `self._attr_name` 赋值 |
 
 这些项目适合后续按模块分批删除，并为对应模块执行聚焦测试。本次提交不同时清理，
