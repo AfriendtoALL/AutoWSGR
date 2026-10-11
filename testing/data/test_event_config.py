@@ -79,6 +79,28 @@ class TestEventConfigFiles:
         assert EVENT_CONFIG_DIR.exists()
         assert EVENT_CONFIG_DIR.parent.name == 'data'
 
+    def test_config_dir_is_inside_package(self) -> None:
+        """配置目录必须在 ``autowsgr/`` 包内才会被 hatchling 打包。
+
+        pyproject 无 ``[tool.hatch.build]`` 配置, hatchling 默认收录包目录
+        下的全部文件 —— 但前提是这些文件确实在包内。放在项目根或
+        ``tools/`` 下会在打包后消失, 导致运行时报「无配置」。
+        """
+        package_dir = PROJECT_ROOT / 'autowsgr'
+        assert package_dir in EVENT_CONFIG_DIR.parents, (
+            f'{EVENT_CONFIG_DIR} 不在 autowsgr/ 包内, 打包后会丢失'
+        )
+
+    def test_pyproject_has_no_narrowing_build_rule(self) -> None:
+        """若日后新增 ``[tool.hatch.build]`` 且排除了数据文件, 须同步处理。"""
+        text = (PROJECT_ROOT / 'pyproject.toml').read_text(encoding='utf-8')
+        if '[tool.hatch.build' not in text:
+            return  # 默认全量收录, 无需检查
+        pytest.skip(
+            'pyproject.toml 新增了 [tool.hatch.build] 配置, 需人工确认 '
+            'autowsgr/data/event/*.yaml 是否被收录'
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 加载与解析
