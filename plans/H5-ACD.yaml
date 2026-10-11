@@ -1,0 +1,45 @@
+# 功能：最强之舟 —— H5 A-C-D 三连夜战（社区俗称"最强之舟"三连）
+#
+# 路线：H5 A → C → D，三个点连续夜战，故称"三连夜战"。
+# 敌编：H5 三点均为 轻母Ξ级IV型×3（无门神），无需驻防、无需带路条件。
+# 夜战时段对面不还手，己方零战损，故无需索敌撤退 / 修船 / 停止前进等防御逻辑。
+# 出击：第 1 舰队 (fleet_id=1) 任意有夜战能力即可。
+#
+# 用法（一次性打满 N 轮，打完自动退出）：
+#   from autowsgr.scheduler import launch
+#   from autowsgr.scheduler.plan_runner import run_yaml_plan
+#   ctx = launch('usersettings.yaml')
+#   run_yaml_plan(ctx, 'H5-ACD.yaml', times=10, fleet_id=1)
+#
+# ─────────────────────────────────────────────────────────────
+# 注意：本计划仅适用于【困难 H5】。
+#   · 想打 E5 简单图时，把 chapter 改成 E（并确认 event 代号对应本期活动），
+#     E5 的 A→B / A→E 路线不会自动关闭，必须先在 I 点驻防
+#     （战巡≥1 + 最高航速≥35节 + 总索敌<300 + 装母≥1，且 E5 的 E 点有 1 潜艇），
+#     否则会误入非夜战点导致收益腰斩。所以 E5 版是另一个文件，不要直接改 chapter 就用。
+
+# ── MapLevel ──
+name: "最强之舟 H5-ACD 三连夜战"
+event: "20260930"   # 当前活动代号；定位活动地图节点数据
+chapter: H          # H = 困难战役（E=简单）；仅 E/H 会被识别为活动战
+map: 5              # H5
+fleet_id: 1         # 出征舰队 = 第 1 队
+fight_condition: 1  # 1=稳步前进 / 2火力万岁 / 3小心翼翼 / 4瞄准 / 5搜索阵型
+
+# 只打 A/C/D 三个点，白名单外的节点一律不前进
+selected_nodes: [A, C, D]
+
+# ── NodeLevel：三个点共用一套打法 ──
+node_defaults:
+  formation: 1         # 1 = 单纵阵
+  night: True          # 追击夜战：经验收益更高（与关卡时段无关）
+  proceed: True        # 默认前进
+
+# ── 逐节点覆写 ──
+node_args:
+  A:
+    proceed: True      # A 打完前进 → C
+  C:
+    proceed: True      # C 打完前进 → D
+  D:
+    proceed: False     # D 打完回港，收工
