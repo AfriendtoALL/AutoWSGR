@@ -31,8 +31,8 @@ from autowsgr.combat.recognition import detect_mvp
 from autowsgr.image_resources import TemplateKey
 from autowsgr.infra.logger import get_logger
 from autowsgr.types import ConditionFlag, Formation, ShipDamageState
-from autowsgr.ui.utils import wait_leave_page
 from autowsgr.vision import ImageChecker
+from autowsgr.vision.waiting import wait_until_leaving
 
 from .history import CombatEvent, CombatHistory, EventType, FightResult
 from .plan import CombatMode, CombatPlan, NodeDecision
@@ -240,7 +240,7 @@ class PhaseHandlersMixin:
             if clicked:
                 _log.info('[Combat] 执行迂回')
                 spot_templates = TemplateKey.SPOT_ENEMY.templates
-                wait_leave_page(
+                wait_until_leaving(
                     self._device,
                     checker=lambda screen: (
                         ImageChecker.find_any(screen, spot_templates, confidence=0.8) is not None

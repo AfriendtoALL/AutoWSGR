@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from autowsgr.infra.logger import get_logger
 from autowsgr.vision import ImageChecker
+from autowsgr.vision.waiting import wait_until_leaving
 
 
 if TYPE_CHECKING:
@@ -161,6 +162,11 @@ def wait_leave_page(
 
     目标页面签名未采集时的降级方案。优先使用 :func:`wait_for_page`。
 
+    .. note::
+       核心等待循环已下沉至 :func:`autowsgr.vision.waiting.wait_until_leaving`
+       (2026-10-11 T3-2 步骤 4: ``combat`` 也需要这套等待能力, 原本它反向
+       import 本模块)。此处保留薄封装, 负责把当前页面名补进日志。
+
     Parameters
     ----------
     candidates:
@@ -183,45 +189,21 @@ def wait_leave_page(
     """
     from autowsgr.ui.page import get_current_page
 
-    deadline = time.monotonic() + timeout
-    attempt = 0
-    _log.debug('[UI] 等待离开: {} -> {} (超时 {:.1f}s)', source or '?', target or '?', timeout)
+    def _describe(screen) -> str | None:
+        """补充"到达了哪个页面"的日志信息 (仅日志用途)。"""
+        return get_current_page(screen, candidates=candidates)
 
-    while True:
-        attempt += 1
-        screen = ctrl.screenshot()
-
-        if not checker(screen):
-            current = get_current_page(screen, candidates=candidates)
-            _log.debug(
-                '[UI] 已离开: {} -> {} (第 {} 次截图, 到达={})',
-                source or '?',
-                target or '?',
-                attempt,
-                current or '未知',
-            )
-            return screen
-
-        _log.debug('[UI] 等待离开 #{}: 仍在 {}', attempt, source or '?')
-
-        if time.monotonic() >= deadline:
-            if probe:
-                _log.debug(
-                    '[UI] 离开超时 (探测): {} -> {} ({} 次截图后仍在 {})',
-                    source or '?',
-                    target or '?',
-                    attempt,
-                    source or '?',
-                )
-                return None
-            msg = (
-                f'离开超时: {source or "?"} -> {target or "?"}, '
-                f'{attempt} 次截图后仍在 {source or "?"}'
-            )
-            _log.error('[UI] {}', msg)
-            raise NavigationError(msg, screen=screen)
-
-        time.sleep(interval)
+    return wait_until_leaving(
+        ctrl,
+        checker,
+        timeout=timeout,
+        interval=interval,
+        source=source,
+        target=target,
+        probe=probe,
+        on_departed=_describe,
+        error_factory=lambda msg, screen: NavigationError(msg, screen),
+    )
 
 
 # ---------------------------------------------------------------------------
