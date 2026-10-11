@@ -64,7 +64,7 @@ def _build_7_4_6ss_plan() -> CombatPlan:
 
     6 潜艇编队打 7-4 周常，选择节点 B/E/D/L/M/K。
     """
-    # 默认节点: 梯形阵، 不夜战, 前进, 中破停
+    # 默认节点: 梯形阵，不夜战, 前进, 中破停
     default_rules = RuleEngine.from_legacy_rules(
         [
             ['DD + CL <= 1', '4'],

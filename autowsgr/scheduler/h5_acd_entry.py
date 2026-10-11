@@ -37,10 +37,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PLAN = PROJECT_ROOT / 'plans' / 'H5-ACD.yaml'
 """默认作战计划。
 
-注意: 项目内另有一份内容相近但**阵型不同**的
-``autowsgr/data/plan/event/H5ACD夜战.yaml`` (formation: 4 梯形阵),
-本文件用的是 ``plans/H5-ACD.yaml`` (formation: 1 单纵阵)。
-两者是有意保留的不同配置, **不要合并**。
+项目内另有一份用途相同的计划
+``autowsgr/data/plan/event/H5ACD夜战.yaml`` (供 ``examples/run_h5acd.py``
+使用)。两者曾分叉 (那份用 formation: 4 梯形阵且缺 ``fight_condition``),
+用户 2026-10-11 确认统一为**单纵阵** 后已统一。
+
+一致性由 ``testing/combat/test_plan_consistency.py`` 锁定 —— 改动其中
+一份时必须同步另一份, 否则测试会失败。
 """
 
 DEFAULT_SETTINGS = PROJECT_ROOT / 'usersettings.yaml'
