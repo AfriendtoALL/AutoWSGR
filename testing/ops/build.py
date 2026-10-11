@@ -1,12 +1,17 @@
-"""建造收取 (collect_built_ships) 端到端测试。
+"""实机验证脚本 — **非 pytest 测试**, 需真实模拟器。
+
+本文件不参与 pytest 收集(无 test_ 前缀)。若要补单元测试请新建
+``test_build_unit.py`` 并用 mock 替代真机依赖。
+详见 testing/ops/README.md。
+
+建造收取 (collect_built_ships) 端到端测试。
 
 用法::
 
     python testing/ops/build.py
     python testing/ops/build.py 127.0.0.1:16384
 
-无页面前置要求 — collect_built_ships() 内部通过 goto_page() 自动导航。
-"""
+无页面前置要求 — collect_built_ships() 内部通过 goto_page() 自动导航。"""
 
 from __future__ import annotations
 

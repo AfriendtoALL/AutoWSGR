@@ -1,4 +1,10 @@
-"""战役交互式端到端测试。
+"""实机验证脚本 — **非 pytest 测试**, 需真实模拟器。
+
+本文件不参与 pytest 收集(无 test_ 前缀)。若要补单元测试请新建
+``test_campaign_unit.py`` 并用 mock 替代真机依赖。
+详见 testing/ops/README.md。
+
+战役交互式端到端测试。
 
 直接运行此脚本即可自动连接设备并执行战役，适合快速手动验证。
 
@@ -22,8 +28,7 @@
     --no-night    不进行夜战
     --log-dir     日志目录（默认 logs/interactive/campaign）
 
-注意: 运行前请确保游戏处于任意正常页面（本脚本会自动导航到战役页面）。
-"""
+注意: 运行前请确保游戏处于任意正常页面（本脚本会自动导航到战役页面）。"""
 
 from __future__ import annotations
 

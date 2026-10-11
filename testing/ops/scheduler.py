@@ -1,4 +1,10 @@
-"""调度器端到端测试 — Ex5 三连夜战 + 定时远征。
+"""实机验证脚本 — **非 pytest 测试**, 需真实模拟器。
+
+本文件不参与 pytest 收集(无 test_ 前缀)。若要补单元测试请新建
+``test_scheduler_unit.py`` 并用 mock 替代真机依赖。
+详见 testing/ops/README.md。
+
+调度器端到端测试 — Ex5 三连夜战 + 定时远征。
 
 用法::
 
@@ -11,8 +17,7 @@
     # 使用自定义 YAML
     python testing/ops/scheduler.py --plan examples/plans/event/20260212/Ex5A夜战.yaml --times 50
 
-前置要求: 游戏处于任意正常页面。
-"""
+前置要求: 游戏处于任意正常页面。"""
 
 from __future__ import annotations
 

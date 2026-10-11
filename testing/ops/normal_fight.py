@@ -1,4 +1,10 @@
-"""常规战 7-4 6SS 交互式端到端测试。
+"""实机验证脚本 — **非 pytest 测试**, 需真实模拟器。
+
+本文件不参与 pytest 收集(无 test_ 前缀)。若要补单元测试请新建
+``test_normal_fight_unit.py`` 并用 mock 替代真机依赖。
+详见 testing/ops/README.md。
+
+常规战 7-4 6SS 交互式端到端测试。
 
 直接运行此脚本即可自动连接设备并执行 7-4 地图 6 潜艇战斗，适合快速手动验证。
 
@@ -18,8 +24,7 @@
     --plan        自定义 YAML 计划文件 (默认使用内置 7-4 6SS 计划)
     --log-dir     日志目录 (默认 logs/interactive/normal_fight)
 
-注意: 运行前请确保游戏处于任意正常页面 (本脚本会自动导航到出征地图页面)。
-"""
+注意: 运行前请确保游戏处于任意正常页面 (本脚本会自动导航到出征地图页面)。"""
 
 from __future__ import annotations
 

@@ -1,4 +1,10 @@
-"""决战 (DecisiveController) 端到端测试。
+"""实机验证脚本 — **非 pytest 测试**, 需真实模拟器。
+
+本文件不参与 pytest 收集(无 test_ 前缀)。若要补单元测试请新建
+``test_decisive_battle_unit.py`` 并用 mock 替代真机依赖。
+详见 testing/ops/README.md。
+
+决战 (DecisiveController) 端到端测试。
 
 用法::
 
@@ -15,8 +21,7 @@
         --level2 甘比尔湾 平海 \\
         --flagship U-1206
 
-前置要求: 游戏处于任意正常页面，脚本会自动导航到决战总览页。
-"""
+前置要求: 游戏处于任意正常页面，脚本会自动导航到决战总览页。"""
 
 from __future__ import annotations
 

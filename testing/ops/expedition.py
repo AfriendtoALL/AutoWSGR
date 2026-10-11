@@ -1,12 +1,17 @@
-"""远征收取 (collect_expedition) 端到端测试。
+"""实机验证脚本 — **非 pytest 测试**, 需真实模拟器。
+
+本文件不参与 pytest 收集(无 test_ 前缀)。若要补单元测试请新建
+``test_expedition_unit.py`` 并用 mock 替代真机依赖。
+详见 testing/ops/README.md。
+
+远征收取 (collect_expedition) 端到端测试。
 
 用法::
 
     python testing/ops/expedition.py
     python testing/ops/expedition.py 127.0.0.1:16384
 
-无页面前置要求 — collect_expedition() 内部先 goto_page(MAIN) 再检测远征通知。
-"""
+无页面前置要求 — collect_expedition() 内部先 goto_page(MAIN) 再检测远征通知。"""
 
 from __future__ import annotations
 

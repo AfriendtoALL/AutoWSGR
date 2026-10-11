@@ -1,4 +1,10 @@
-"""演习 (run_exercise) 端到端测试。
+"""实机验证脚本 — **非 pytest 测试**, 需真实模拟器。
+
+本文件不参与 pytest 收集(无 test_ 前缀)。若要补单元测试请新建
+``test_exercise_unit.py`` 并用 mock 替代真机依赖。
+详见 testing/ops/README.md。
+
+演习 (run_exercise) 端到端测试。
 
 用法::
 
@@ -8,8 +14,7 @@
     # 指定舰队和对手 (对手编号 1-5，不传则挑战所有可用对手)
     python testing/ops/exercise.py 127.0.0.1:16384 --fleet 2 --rival 3
 
-无页面前置要求 — ExerciseRunner 内部通过 goto_page() 自动导航到演习面板。
-"""
+无页面前置要求 — ExerciseRunner 内部通过 goto_page() 自动导航到演习面板。"""
 
 from __future__ import annotations
 
