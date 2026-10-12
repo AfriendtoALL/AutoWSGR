@@ -22,9 +22,19 @@
 
 未覆盖（需用户补图）
 --------------------
-- ``day_battle`` 昼战 —— 用户反馈昼战流程复杂，未截到
 - ``flagship_severe_damage`` 旗舰大破 —— 触发概率低
 - ``get_ship`` 舰船掉落页 —— 用户已魔改为快速点击跳过，流程不再经过
+
+昼战的多阶段（2026-10-12 用户补充并提供截图）
+----------------------------------------------
+昼战并非单一画面：顶部横幅显示当前阶段（BUFF / 先制鱼雷 / 首轮炮击 /
+鱼雷战…），且**阶段数量不固定** —— 无航系则无航空战，无雷值则无先制鱼雷 /
+鱼雷战，单横阵还多一轮先制反潜。
+
+但这些**对识别层不构成影响**：`FIGHT_PERIOD` 的模板只有 20x21 像素，
+落在左上角固定的「复纵阵 / 反航战」标签区（实测最佳匹配位置 (54, 18)，
+四张昼战图完全一致、分数 0.997），**完全不读阶段横幅**。
+:class:`TestDayBattlePhases` 把这个结论锁死 —— 任何阶段都应命中同一状态。
 """
 
 from __future__ import annotations
@@ -40,6 +50,14 @@ from autowsgr.combat.state import CombatPhase
 
 # fixture 统一放testing/fixtures/, 跨测试目录共享 (combat / ui 都会用到)
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / 'fixtures' / 'screenshots' / 'combat'
+
+#: 昼战各阶段的实机截图 (用户 2026-10-12 提供)。值是顶部横幅文字, 仅供报错时定位。
+DAY_BATTLE_PHASES = {
+    'day_battle_buff.png': 'BUFF',
+    'day_battle_pro_torpedo.png': '先制鱼雷',
+    'day_battle_salvo1.png': '首轮炮击',
+    'day_battle_torpedo.png': '鱼雷战',
+}
 
 
 def load(name: str) -> np.ndarray:
@@ -81,6 +99,72 @@ class TestPositiveSamples:
 
     def test_night_battle(self) -> None:
         assert 'FIGHT_PERIOD' in match_all(load('night_battle.png'))
+
+
+class TestDayBattlePhases:
+    """昼战各阶段都必须命中 ``FIGHT_PERIOD`` (用户 2026-10-12 提供截图)。
+
+    背景: 昼战顶部横幅会写当前阶段 (BUFF / 先制鱼雷 / 首轮炮击 / 鱼雷战…),
+    且**阶段数量不固定** —— 无航系无航空战、无雷值无先制鱼雷、单横阵多一轮
+    先制反潜。若识别依赖横幅, 每种编成都得单独标定模板; 实测并非如此。
+    """
+
+    @pytest.mark.parametrize('name', sorted(DAY_BATTLE_PHASES))
+    def test_phase_is_identified(self, name: str) -> None:
+        assert 'FIGHT_PERIOD' in match_all(load(name)), (
+            f'{name} (阶段「{DAY_BATTLE_PHASES[name]}」) 未命中 FIGHT_PERIOD'
+        )
+
+    @pytest.mark.parametrize('name', sorted(DAY_BATTLE_PHASES))
+    def test_not_confused_with_other_states(self, name: str) -> None:
+        """昼战不得被误认成结算 / 夜战提示等其它状态。"""
+        hits = match_all(load(name))
+        assert hits == {'FIGHT_PERIOD'}, f'{name} 命中了多余状态: {hits}'
+
+    def test_day_and_night_share_one_state(self) -> None:
+        """昼战与夜战是**同一个** CombatPhase —— 不按阶段细分。
+
+        状态机只有 ``FIGHT_PERIOD`` 一个「战斗动画中」状态, 所以昼战无论
+        走到哪个阶段都不该有新 phase。若将来有人想按阶段细分状态机,
+        这条会提醒他同步改转移表。
+        """
+        day = [match_all(load(n)) for n in sorted(DAY_BATTLE_PHASES)]
+        night = match_all(load('night_battle.png'))
+        assert all(d == {'FIGHT_PERIOD'} for d in day), f'昼战有阶段未被识别: {day}'
+        assert night == {'FIGHT_PERIOD'}, f'夜战识别结果变了: {night}'
+
+    def test_fight_period_template_ignores_phase_banner(self) -> None:
+        """模板匹配位置在左上角固定标签区, 与顶部阶段横幅无关。
+
+        直接验证「为什么阶段不影响识别」: 对四张不同阶段的图, 模板最佳
+        匹配位置**完全相同**且分数极高。若哪天改成读横幅, 这里会失败。
+        """
+        import cv2
+
+        tpl_path = Path('autowsgr/data/images/combat/fight_period_540p.png')
+        assert tpl_path.exists(), f'模板文件缺失: {tpl_path}'
+        tpl = cv2.imread(str(tpl_path), cv2.IMREAD_GRAYSCALE)
+        assert tpl is not None
+
+        results: dict[str, tuple[tuple[int, int], float]] = {}
+        for name in sorted(DAY_BATTLE_PHASES):
+            screen = load(name)
+            gray = cv2.cvtColor(screen, cv2.COLOR_RGB2GRAY)
+            res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
+            _, score, _, loc = cv2.minMaxLoc(res)
+            results[name] = (loc, round(score, 3))
+
+        locs = {loc for loc, _ in results.values()}
+        assert len(locs) == 1, f'不同阶段模板匹配位置不一致: {results}'
+        for name, (_, score) in results.items():
+            assert score >= 0.95, f'{name} 匹配分数偏低: {score}'
+
+        # 位置应在左上角 —— 那里是「阵型/航向」固定标签, 不是顶部横幅
+        (x, y), _ = next(iter(results.values()))
+        assert x < 120 and y < 60, (
+            f'模板匹配位置 ({x}, {y}) 不在左上角固定标签区, '
+            f'疑似改为依赖阶段横幅 —— 请重新评估: {results}'
+        )
 
 
 # ══════════════════════════════════════════════
