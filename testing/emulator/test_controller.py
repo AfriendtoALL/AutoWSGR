@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 
 from autowsgr.emulator import ScrcpyController
+from autowsgr.emulator.controller.video_stream import ScrcpyVideoStream
 from autowsgr.infra import EmulatorConnectionError
 
 
@@ -175,19 +176,33 @@ class TestScrcpyControllerControlFlow:
 
 
 class TestScrcpyControllerScreenshot:
-    """测试截图功能（使用 mock）。"""
+    """测试截图功能（使用 mock）。
+
+    帧与存活状态现由 :class:`ScrcpyVideoStream` 持有，故这里构造一个**真实**
+    stream 实例但不调 ``open()``（避免拉起真实 scrcpy），再手动注入帧状态。
+    被测对象是``screenshot()`` 的等待/重试循环本身。
+    """
+
+    @staticmethod
+    def _attach_stream(ctrl, *, alive: bool = True):
+        """给 controller 挂一个未打开的 stream，并设定存活状态。"""
+        stream = ScrcpyVideoStream(
+            device_provider=lambda: None,
+            native_resolution=ctrl._native_resolution or (960, 540),
+            screenshot_timeout=ctrl._screenshot_timeout,
+        )
+        stream._alive = alive
+        ctrl._stream = stream
+        return stream
 
     def test_screenshot_returns_last_frame(self):
-        """screenshot() 返回 _last_frame 中的图像。"""
+        """screenshot() 返回 stream 中的最新帧。"""
         ctrl = ScrcpyController(serial='test')
         ctrl._resolution = (4, 3)
-
-        # mock 视频流，避免启动真实 scrcpy 连接
-        ctrl._ensure_stream_alive = MagicMock()
-        ctrl._alive = True
+        stream = self._attach_stream(ctrl)
 
         img = np.zeros((3, 4, 3), dtype=np.uint8)
-        ctrl._last_frame = img
+        stream._last_frame = img
 
         result = ctrl.screenshot()
         assert result.shape == (3, 4, 3)
@@ -197,11 +212,8 @@ class TestScrcpyControllerScreenshot:
         """截图超时应抛异常。"""
         ctrl = ScrcpyController(serial='test', screenshot_timeout=0.2)
         ctrl._resolution = (4, 3)
-
-        # mock 视频流，避免启动真实 scrcpy 连接
-        ctrl._ensure_stream_alive = MagicMock()
-        ctrl._alive = True
-        ctrl._last_frame = None  # 始终无帧
+        stream = self._attach_stream(ctrl)
+        stream._last_frame = None  # 始终无帧
 
         with pytest.raises(EmulatorConnectionError, match='截图超时'):
             ctrl.screenshot()
@@ -210,23 +222,26 @@ class TestScrcpyControllerScreenshot:
         """首次返回 None 后重试成功。"""
         ctrl = ScrcpyController(serial='test', screenshot_timeout=5.0)
         ctrl._resolution = (2, 2)
-
-        # mock 视频流，避免启动真实 scrcpy 连接
-        ctrl._ensure_stream_alive = MagicMock()
-        ctrl._alive = True
+        stream = self._attach_stream(ctrl)
 
         img = np.zeros((2, 2, 3), dtype=np.uint8)
 
         # 直接测试逻辑：先 None 后成功
-        ctrl._last_frame = None
+        stream._last_frame = None
         # 在 screenshot() 循环中手动注入帧
         import threading
 
         def _inject_frame():
             time.sleep(0.05)
-            ctrl._last_frame = img
+            stream._last_frame = img
 
         threading.Thread(target=_inject_frame, daemon=True).start()
         result = ctrl.screenshot()
         assert result.shape == (2, 2, 3)
         assert result is img
+
+    def test_screenshot_requires_connected_stream(self):
+        """未 connect() 就截图必须报连接错误，而不是 AttributeError。"""
+        ctrl = ScrcpyController(serial='test')
+        with pytest.raises(EmulatorConnectionError, match='视频流未初始化'):
+            ctrl.screenshot()
