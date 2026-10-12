@@ -1,8 +1,51 @@
 # AutoWSGR 第二 / 三梯队改进方案
 
 > 编写日期：2026-10-11
+> 最近校正：2026-10-12（按**代码**核对完成状态，非按记忆）
 > 前置：第一梯队已落地（见文末「已完成」）
 > 配套：[Alas 对标评审报告](alas-comparison-review-2026-10-11.md)
+
+---
+
+## ⚠️ 状态总览（2026-10-12 校正）
+
+**以代码为准，不以本文件的勾选框为准** —— 下表是逐项核实过代码证据的结论：
+
+| 项 | 状态 | 代码证据 |
+|---|---|---|
+| T2-1 调度器熔断 | ✅ 完成 | `scheduler/recovery.py` 指数退避 + `DEFAULT_MAX_CONSECUTIVE_FAILURES` |
+| T2-2 `_overlay_ready` ctx 化 | ✅ 完成 | `context/game_context.py:149` `overlay_ready_maps` |
+| T2-3 活动期号参数化 | ✅ 完成 | `autowsgr/data/event/{20260212,20260730,20260930}.yaml` + `data/event_config.py` |
+| T3-1 拆分 `ScrcpyController` | ⚠️ **部分完成**（见下） | 939→565 行，拆出 `adb_conn`/`video_stream`/`touch` 三模块 |
+| T3-2 消除逆向依赖 | ⚠️ **部分完成**（见下） | `combat` 不再 import `ops`/`ui`/`cv2`/`PIL`；`fight()` 覆盖率未做 |
+| T3-3① ops 脚本标注+保护 | ✅ 完成 | `testing/ops/README.md` + `conftest.py::pytest_collect_file` + 57 项回归 |
+| T3-3② 实机截图 fixture | 🟡 **部分完成**（见下） | 5 张入库 + 19 项断言；缺昼战、旗舰大破 |
+| P0-1 战斗恢复死循环 | ✅ 已封 | `combat/engine.py:105` `max_recovery_attempts` |
+| P0-2 调度器无熔断 | ✅ 已封 | `scheduler/recovery.py` |
+| P0-3 版本控制 | ✅ 已封 | 889 文件已追踪，`.gitignore` 干净 |
+
+### 两项「部分完成」的具体差距
+
+**T3-1 未做的部分**：本方案原定新增 `TouchInjectorSelector`（多后端探测 + 自愈）。
+实际落地的是 `TouchChannelChain` —— 一个**固定顺序的三级降级链**
+（MaaTouch → 常驻 shell → 单次 adb input），失败即永久降级。
+二者区别：前者能「标记失败后重新探测」（自愈），后者不能。
+当前选择降级链是合理的（MaaTouch 静默失效从机制上不可能，见
+`maatouch.py` 的 EOF 哨兵设计），但 `mark_failed` 自愈语义确实未实现。
+
+**T3-2 未做的部分**：依赖方向已全部理顺（三条静态检查 + 运行时子进程检查守着），
+但**验收标准第 3 条「`fight()` 主循环首次获得覆盖率」未做** —— 目前没有端到端
+跑完整战斗流程的测试，只有各子模块的单元测试。这是 T3-2 剩余的唯一缺口。
+
+### 仍完全未做的两项（Alas 六项差距）
+
+1. **卡死检测** —— `grep stuck_timer` 零命中。Alas 用 60s/180s 双计时器 +
+   `show_function_call()` 打印完整调用栈。**熔断只在「失败返回」时触发，
+   而真卡死是永不返回，熔断根本不会被触发** —— 这是当前 7×24 挂机
+   最大的盲区。注意 `scheduler/plan_runner.py:100` 的 `_watchdog` 是
+   **停止信号监听**，不是 Alas 意义上的卡死检测。
+2. **异常→恢复映射** —— 95 处 `except Exception`，仅 12 处直接吞。
+   没有集中的「异常类型 → 恢复动作」映射表，无法回答「这次失败会自愈吗」。
 
 ---
 
@@ -181,7 +224,15 @@ class DailyScheduler:
 
 ---
 
-## T2-2 `_overlay_ready` 从类变量改为上下文状态
+## T2-2 `_overlay_ready` 从类变量改为上下文状态 ✅ 已完成 2026-10-11
+
+> **落地方案与本节原设计略有出入**：最终没有新增独立的状态容器类，
+> 而是在 `GameContext` 上加了一个字段
+> `overlay_ready_maps: set[tuple[str | None, str, str | None]]`（键控关卡身份）。
+> 选择理由：ctx 在触发器模式下跨轮存活，生命周期恰好匹配「弹层可复用」的语义；
+> 而类变量是进程级的（同进程跑不同计划会共享、重启即丢、永不清理）。
+> 测试替身可能没有该字段，故读取处用 `getattr(ctx, 'overlay_ready_maps', None)`
+> 兜底（见 `ops/normal_fight.py:56`）。
 
 ### 问题证据
 
@@ -235,12 +286,15 @@ def _mark_overlay_ready(self, ctx: GameContext, key: tuple) -> None:
 
 ### 验收标准
 
-- [ ] 单测：连续两次 `NormalFightRunner` 共享同一 ctx，第二次能命中缓存
-- [ ] 单测：不同 ctx 之间互不影响
+- [x] 单测：连续两次 `NormalFightRunner` 共享同一 ctx，第二次能命中缓存
+      → `test_normal_fight_unit.py::test_skip_check_survives_new_runner_instance`
+- [x] 单测：不同 ctx 之间互不影响
+      → `test_normal_fight_unit.py::test_different_ctx_does_not_share_state`
+- [x] 实机：日志不再每轮「已关闭残留关卡浮层」（2026-10-11 反馈驱动）
 
 ---
 
-## T2-3 活动期号参数化
+## T2-3 活动期号参数化 ✅ 已完成 2026-10-11
 
 ### 问题证据
 
@@ -326,15 +380,20 @@ if entrance is not None and not cfg['supports_entrance']:
 
 ### 验收标准
 
-- [ ] 单测：加载 20260930.yaml，断言 `node_positions` 与迁移前一致
-- [ ] 单测：请求不存在的活动，断言抛 `ActionFailedError` 且错误信息含「无配置文件」
-- [ ] 实机：H5-ACD 计划跑 3 轮成功
+- [x] 单测：加载 20260930.yaml，断言 `node_positions` 与迁移前一致
+      → `testing/data/test_event_config.py::test_coordinates_match_migration`
+- [x] 单测：请求不存在的活动，断言抛 `EventConfigError`
+      → `test_unknown_event_raises`
+- [x] 实机：H5-ACD 计划跑 3 轮成功（2026-10-12 复验：`success (节点数=2, 恢复=0)`）
+- [x] **额外加固**：模板名必须是 `<kind>_<期号>` 格式（`recognizer._is_event_overlay_button`
+      依赖 `startswith('fight_button')`），缺配置**显式报错不静默放行**
+      → `test_template_names_keep_kind_prefix`
 
 ---
 
 # 第三梯队：重构
 
-## T3-1 拆分 `ScrcpyController`（939 行上帝类）
+## T3-1 拆分 `ScrcpyController`（939 行上帝类）⚠️ 部分完成 2026-10-12
 
 ### 问题证据
 
@@ -428,14 +487,33 @@ Alas 的对应做法：`Device` 聚合 10 种截图方法，靠 `screenshot_meth
 
 ### 验收标准
 
-- [ ] 单测：`TouchInjectorSelector` 在首选后端抛异常时正确降级
-- [ ] 单测：后端在 `mark_failed` 后下一轮会被重新探测（自愈）
-- [ ] 单测：全部后端不可用时抛 `DeviceUnavailableError`
-- [ ] 实机：H5-ACD 3 轮成功，日志显示实际使用的注入后端
+> ⚠️ **原定验收标准已按实际落地重写**。原方案要求新增 `TouchInjectorSelector`
+> （多后端列表 + `mark_failed` 后重新探测的自愈机制），实际实现的是
+> `TouchChannelChain` —— 固定顺序三级降级链，**不具备自愈能力**。
+> 详见文首「两项部分完成的具体差距」。
+
+- [x] 单测：MaaTouch 抛异常时正确降级到常驻 shell，且**永久**降级
+      → `test_touch_channel.py::test_maatouch_failure_drops_to_shell_and_closes_maatouch`
+- [x] 单测：全部通道失败时兜底到单次 adb input
+      → `test_both_fail_reaches_adb`
+- [x] 单测：MaaTouch 只处理 tap，swipe 必须绕过（它只实现了 click）
+      → `test_non_tap_never_uses_maatouch`
+- [x] 变异验证（12 个变异全被捕获）：降级不置空 / MaaTouch 接管 swipe /
+      移除转发 / 并发重连去锁 / 控制流无限重试（挂死）等
+- [x] 实机对照：`tools/diagnostics/probe_controller.py` 采before/after 基线 diff
+- [x] 实机：H5-ACD 3 轮成功，日志显示实际使用的注入通道
+- [ ] 单测：后端在 `mark_failed` 后下一轮会被重新探测（**自愈 —— 未实现**）
+- [ ] 单测：全部后端不可用时抛 `DeviceUnavailableError`（**未实现**，当前逐级兜底不抛）
+
+**顺带修的既有缺陷**（2026-10-12 实机发现）：`_resolve_adb_path()` 原只用
+`shutil.which('adb')`，Windows 上 adb 不在 PATH 故恒None，且 `_adb_path` 只在
+`detect_mumu_folder()` 成功分支里被赋值 → 常驻 shell 通道长期不可用。
+修复后 `persistent_shell` false→true，**swipe 延迟 250ms → 0ms**
+（MaaTouch 只实现 click，滑动全靠此通道）。
 
 ---
 
-## T3-2 消除四个方向的逆向依赖
+## T3-2 消除四个方向的逆向依赖 ⚠️ 部分完成 2026-10-12
 
 ### 问题证据
 
@@ -524,9 +602,16 @@ from autowsgr.vision import connected_components
 
 ### 验收标准
 
-- [ ] 静态检查：`grep -rn "^\s\+\(from\|import\) autowsgr" autowsgr/combat/` 仅命中 `emulator`/`vision`/`context`/`infra`（同层或下层）
-- [ ] 单测：`CombatEngine` 能在**不 import ops** 的前提下构造并跑完 `fight()`
-- [ ] 单测：`fight()` 主循环首次获得覆盖率（当前为零）
+- [x] 静态检查：`combat` 不再 import `ops`/`ui`/`cv2`/`PIL`
+      → `test_engine_circuit_breaker_unit.py::test_combat_layer_does_not_import_ops`
+        （AST 静态检查，非正则—— 正则会漏掉函数体内的局部 import）
+- [x] 单测：`CombatEngine` 能在**不 import ops** 的前提下构造并跑完 `fight()`
+      → `test_waiting.py::TestCombatLayerIsIndependent`（子进程导入检查，
+        隔离已加载模块以避免全量测试下的误报）
+- [ ] 单测：`fight()` 主循环首次获得覆盖率（**当前为零 —— 唯一剩余缺口**）
+
+**剩余缺口说明**：目前只有各子模块的单元测试（识别器、处理器、引擎状态机），
+没有端到端跑完整战斗流程的测试。这是 T3-2 剩下的唯一工作。
 
 ---
 
@@ -657,31 +742,71 @@ def test_recognizer(case, screen):
 
 ### 验收标准
 
-- [ ] `pytest testing/ --collect-only` 计数显著上升（当前 1335 + 至少 30）
-- [ ] 每个 fixture 图都有 manifest 条目，测试全绿
-- [ ] 故意改坏一个阈值，fixture 测试必须失败（变异验证）
+- [x] `pytest testing/` 计数上升至**1638 passed / 25 skipped**
+      （原1335 → T2-1 1356 → 今日 1638）
+- [x] 每个 fixture 图都有 manifest 条目，测试全绿
+      → `testing/fixtures/screenshots/combat/` + `test_combat_fixtures.py` 19 项
+- [x] 故意改坏一个阈值，fixture 测试必须失败（变异验证 3 个全被捕获）
+      → RESULT 置信度 0.85→0.999 挂 / PROCEED 签名张冠李戴挂 /
+      移除 `allow_event_overlay_anchor` 开关挂
+
+### 仍缺（未做）
+
+- [ ] `day_battle` 昼战 fixture —— 用户反馈流程复杂未截；下次跑常规战时补
+      （H5 活动战是夜战，没有昼战场景）
+- [ ] 旗舰大破 fixture —— 触发概率低
+- [ ] `get_ship` 舰船掉落页 —— **用户已魔改为快速点击跳过，流程不再经过，
+      该 fixture 无意义，不要再尝试采**
+- [ ] `fight()` 主循环端到端测试 —— 见 T3-2 验收第 3 条
+
+**已知的采集器陷阱**（2026-10-12 实测踩坑）：
+
+1. **验证 fixture 必须用 `PHASE_SIGNATURES`**（`combat/recognizer.py`），
+   **不是** `build_transitions()` 的返回 —— 后者只有后继列表没有签名，
+   拿它验证会得到「取到签名: []」的空结果而误判为全 MISS。
+2. **`battle_prep`（出征准备页）会命中 `EVENT_MAP_PAGE`** —— 这不是 bug，
+   它正是 2026-10-08「出征瞬间误判回港」事故的根因，
+   `allow_event_overlay_anchor` 门控是唯一防线。已有断言锁死。
+3. **`START_FIGHT` 匹配失败不是缺陷** —— 签名 `template_key=None`，
+   注释明写「过渡态，不直接用模板匹配」，靠转移表时序推进。
+4. **采集器必须在同一帧上打标签** —— 原来用 `identify_current_page(ctx)`
+   会**自己另截一张图**，导致落盘的图与标签不是同一帧，动画页标签必然错位。
+   已改用 `get_current_page(screen)`。
+5. **连拍必须去重** —— 0.4s × 480s 会产出上千张近乎相同的图。
+   按缩略图（64x36）**平均绝对差**判重（不要用 maxdiff，单像素变化会被
+   `INTER_AREA` 量化抹平），静止页只留 2 张。
 
 ---
 
 ## 优先级与排期建议
 
-| 阶段 | 项目 | 预估工作量 | 风险 | 依赖 |
-|---|---|---|---|---|
-| **立即** | T3-3 ① 标注+保护 ops 实机脚本 | ✅ 完成 | 无 | 无 |
-| **立即** | T2-1 调度器熔断 | 2~3h | 中 | 无 |
-| **本周** | T2-2 `_overlay_ready` ctx 化 | 1h | 低 | 无 |
-| **本周** | T3-3 ② 截图 fixture | 4~6h | 低 | 需采集截图 |
-| **下周** | T2-3 活动期号参数化 | 4~6h | 中 | 无 |
-| **下周** | T3-2 依赖注入 | 1~2天 | 中 | T2-3（模板解析入口会变） |
-| **排期** | T3-1 拆分 ScrcpyController | 2~3天 | 高 | 需整块时间 + 实机回归窗口 |
+> 2026-10-12 更新：下表为**原始排期建议**，实际执行顺序有调整。
+> 已完成：T2-1 → T3-3① → T2-2 → T2-3 → T3-2 → T3-1（比建议顺序更快，
+> 因为 T3-2 的部分内容与 T2-3 解耦）。T3-3② 卡在需要用户手动截昼战。
 
-**建议顺序**：T2-1（7×24 挂机的必要条件）→ T3-3①（白捡）→ T2-2 → T2-3 → T3-3② → T3-2 → T3-1
+| 阶段 | 项目 | 预估工作量 | 风险 | 依赖 | 实际状态 |
+|---|---|---|---|---|---|
+| **立即** | T3-3 ① 标注+保护 ops 实机脚本 | ✅ 完成 | 无 | 无 | ✅ 2026-10-11 |
+| **立即** | T2-1 调度器熔断 | 2~3h | 中 | 无 | ✅ 2026-10-11 |
+| **本周** | T2-2 `_overlay_ready` ctx 化 | 1h | 低 | 无 | ✅ 2026-10-11 |
+| **本周** | T3-3 ② 截图 fixture | 4~6h | 低 | 需采集截图 | 🟡 5/7 张 |
+| **下周** | T2-3 活动期号参数化 | 4~6h | 中 | 无 | ✅ 2026-10-11 |
+| **下周** | T3-2 依赖注入 | 1~2天 | 中 | T2-3 | ⚠️ 依赖已解，仅差fight() 覆盖率 |
+| **排期** | T3-1 拆分 ScrcpyController | 2~3天 | 高 | 需整块时间 + 实机回归窗口 | ⚠️ 3/4 完成，差 `mark_failed` 自愈 |
 
-**先做 T2-1 的理由**：它是「放着不管跑一整夜」这一目标的**唯一硬阻碍**。其余项目提升的是可维护性和长期演进能力，而 T2-1 决定的是今晚能不能安心睡觉。
+**剩余工作的建议顺序**（2026-10-12）：
+
+1. **卡死检测（`stuck_timer`）** —— 最该做。熔断只在「失败返回」时触发，
+   真卡死是永不返回，熔断不会被触发。这是 7×24 挂机最大的盲区。
+2. **`fight()` 主循环端到端测试** —— T3-2 唯一剩余缺口。
+3. 昼战fixture 补采（低优先，等常规战时顺手做）
+4. 异常→恢复映射表（收益明确但改动面大）
 
 ---
 
-## 已完成（第一梯队，2026-10-11）
+## 已完成
+
+### 第一梯队（2026-10-11）
 
 | 项 | 内容 | 提交 |
 |---|---|---|
@@ -691,4 +816,16 @@ def test_recognizer(case, screen):
 | P2-5 | 7 个诊断脚本收进 `tools/diagnostics/`，消除硬编码路径，修复无效验证 | `8a0e0c8` |
 | **T2-1** | **调度器故障恢复与熔断**（阈值 5，`--max-failures` 可调），21 项单测 | 见 git log |
 
-全量测试：**1356 passed / 25 skipped**（T2-1 前为 1335）。
+### 第二 / 三梯队（2026-10-11 ~ 2026-10-12）
+
+| 项 | 内容 | 提交 |
+|---|---|---|
+| **T3-3①** | ops 实机脚本标注 + `pytest_collect_file` 防误改保护，57 项回归 | 见 git log |
+| **T2-2** | `_overlay_ready` 类变量 → `GameContext.overlay_ready_maps` | 见 git log |
+| **T2-3** | 活动期号参数化，新增 `data/event/*.yaml` + `data/event_config.py`，23 项单测 | 见 git log |
+| **T3-2** | 消除 `combat → ops/ui/cv2/PIL` 逆向依赖（下沉到 `vision/` 与 `data/`），AST 静态 + 子进程运行时双重检查 | 见 git log |
+| **T3-1** | `ScrcpyController` 939→565 行，拆出 `adb_conn` / `video_stream` / `touch` 三模块，59 项新测试 | `1af9ecf` `89a4259` `8906a13` |
+| **缺陷修复** | 常驻 adb shell 通道恒不可用 → swipe 延迟 250ms→0ms | `ec44166` |
+| **T3-3②** | 5 张实机战斗页 fixture + 19 项断言 + 采集脚本时序修复 | `ff22a69` |
+
+全量测试：**1638 passed / 25 skipped**（第一梯队前1335→ T2-1 后 1356 → 今日 1638）。
