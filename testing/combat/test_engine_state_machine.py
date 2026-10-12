@@ -273,23 +273,72 @@ class TestOverlayAnchorGate:
 # ══════════════════════════════════════════════
 
 
-class TestNoBlindClickDuringFightAnimation:
-    def test_fight_period_poll_action_is_sleep_not_click(self, engine, monkeypatch) -> None:
-        """``FIGHT_PERIOD`` 等待期的 poll_action 必须是纯 sleep。
+class TestFightPeriodAndSettleSkip:
+    """战斗动画期不点击, 与结算期的安全位盲点穿行。
 
-        战斗动画期盲点曾把夜战整段点穿、PROCEED 对话框被误认成夜战提示
-        (2026-10-08)。此断言锁住 ``_get_poll_action`` 在该阶段不返回点击动作。
+    更正 (2026-10-12 用户指出)
+    --------------------------
+    初版断言写的是「等待期盲点会把夜战整段点穿」—— **说法有误**,
+    把两个不同机制混为一谈了。实际分工是:
+
+    - ``FIGHT_PERIOD`` (战斗动画期): poll_action 是纯 ``time.sleep``,
+      **不点击**。此时结算三层还没出现, 安全位点击没有意义; 而动画中的
+      加速点击另有 :func:`click_speed_up` 的专门场景。
+    - 结算三层 (战果/经验/掉落): 由处理器层的 ``_blind_skip_settlement``
+      用 :func:`click_settlement_skip` 连点**安全位**推进 —— 结算页
+      全屏点击有效(点掉当前层), 而该坐标在全部相关页面上无可交互元素,
+      **误触无害**。这是**主动**的推进手段, 不是防止点穿的护栏。
+
+    真正的护栏是**坐标选得对**: 必须取左下象限 x≈0.26。取 x=0.5 会点中
+    阵型选择界面的「单横阵」(该按钮一直贴到屏幕底缘)—— 2026-10-10 修正。
+    """
+
+    def test_fight_period_poll_action_does_not_click(self, engine, monkeypatch) -> None:
+        """"当前 phase 为 FIGHT_PERIOD 时"的轮询不得点击 (只sleep)。
+
+        下标对应关系 (``_update_state`` 先算poll_action 再更新 ``self._phase``):
+        认出 ``FIGHT_PERIOD`` 的那次调用, 其 poll_action 是在**当前 phase
+        仍为 FORMATION** 时构造的; 真正命中 ``FIGHT_PERIOD`` 分支的是
+        **下一次**调用 (认出 RESULT, 但出发态是 FIGHT_PERIOD)。
         """
         _, recognizer = run_fight(engine, SIMPLE_EVENT_PATH, monkeypatch)
-        # FIGHT_PERIOD 之后那一步是从 FIGHT_PERIOD 出发的
         idx = SIMPLE_EVENT_PATH.index(CombatPhase.FIGHT_PERIOD) + 1
         poll = recognizer.calls[idx]['poll_action']
-        assert poll is not None, 'FIGHT_PERIOD 等待期应有 poll_action(加速/等待)'
-        # 纯 sleep 动作: 传入任意 screen 都不应触发设备点击
+        assert poll is not None, 'FIGHT_PERIOD 等待期应有 poll_action'
+
         ctrl = MagicMock()
         engine._device = ctrl
         poll(MagicMock())
-        assert ctrl.click.call_count == 0, 'FIGHT_PERIOD 等待期绝不可盲点'
+        assert ctrl.click.call_count == 0, (
+            'FIGHT_PERIOD 等待期不应点击 —— 结算安全位是结算期的事, '
+            '此处盲点无意义(引擎该分支就是 sleep)'
+        )
+
+    def test_safe_zone_avoids_formation_button_row(self) -> None:
+        """「结算安全位的 x 必须避开阵型按钮列 (x 0.45~0.97)。
+
+        阵型选择界面的「单横阵」贴到屏幕底缘, 底缘中部点击会误触它 ——
+        2026-10-10 用户指出后把 ``SETTLE_SKIP`` 的 x 从 0.5 改到 0.26。
+        """
+        from autowsgr.combat.actions import Coords
+
+        x, y = Coords.SETTLE_SKIP
+        assert x < 0.45, f'SETTLE_SKIP.x={x} 落在阵型按钮列区间内, 会误触「单横阵」'
+        assert 0.9 < y <= 1.0, f'SETTLE_SKIP.y={y} 应在屏幕底缘安全带内'
+
+    def test_settle_skip_only_used_by_settlement_handler(self) -> None:
+        """「安全位点击只允许出现在结算处理器里。
+
+        它是「点掉当前层」的推进手段; 若被挪到战斗动画期使用, 语义就错了
+        (动画期根本没有可点掉的层)。
+        """
+        import ast
+        import pathlib
+
+        engine_src = pathlib.Path('autowsgr/combat/engine.py').read_text(encoding='utf-8')
+        assert 'click_settlement_skip' not in engine_src, (
+            '结算安全位点击不应出现在 engine.py —— 它属于处理器层'
+        )
 
 
 # ══════════════════════════════════════════════
