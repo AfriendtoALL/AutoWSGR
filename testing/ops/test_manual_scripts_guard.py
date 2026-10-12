@@ -21,7 +21,10 @@ from pathlib import Path
 
 import pytest
 
-from testing.conftest import MANUAL_E2E_SCRIPT_NAMES
+from testing.conftest import (
+    MANUAL_E2E_SCRIPT_NAMES,
+    looks_like_misrenamed_manual_script,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -76,31 +79,51 @@ class TestMisrenameGuard:
     """若有人把实机脚本改名为 ``test_*.py``, 必须立即报错而非静默收集。"""
 
     def test_guard_rejects_renamed_script(self, tmp_path: Path) -> None:
-        """核心行为: 伪装成 test_*.py 后, pytest 收集必须失败并说明原因。
+        """核心行为: 伪装成 test_*.py 后必须被判为误改名。
 
-        用 ``build.py`` 复制成 ``test_build.py`` (名单内的名字才会触发保护)。
+        刻意**不造真实文件** —— 之前版本在项目目录里 ``shutil.copy`` 出
+        ``test_build.py``, 进程被中断 (超时/强杀) 时 ``finally`` 来不及清理,
+        残留文件会让**下一次全量跑直接收集失败** (2026-10-12 踩过, 手动
+        清掉才发现是这里留下的)。现在直接调``conftest`` 里的同一份判定函数,
+        测的是真代码路径且零副作用。
         """
-        import subprocess
-        import sys
+        assert 'build' in MANUAL_E2E_SCRIPT_NAMES, (
+            f'实机脚本名单应含 build, 实际: {sorted(MANUAL_E2E_SCRIPT_NAMES)}'
+        )
 
-        fake = OPS_DIR / 'test_build.py'
-        shutil.copy(OPS_DIR / 'build.py', fake)
-        try:
-            proc = subprocess.run(  # noqa: S603
-                [
-                    sys.executable, '-m', 'pytest',
-                    str(fake), '--collect-only', '-q',
-                ],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                timeout=120,
-                check=False,
+        # 正例: 名单里的脚本加 test_ 前缀必须被识别为误改名
+        assert looks_like_misrenamed_manual_script('test_build.py') == 'build'
+        for name in sorted(MANUAL_E2E_SCRIPT_NAMES):
+            assert looks_like_misrenamed_manual_script(f'test_{name}.py') == name
+
+        # 反例: 真正的单元测试 (带 _unit 后缀 / 不在名单里) 不能被误伤
+        for name in (
+            'test_build_unit.py',
+            'test_scheduler_unit.py',
+            'test_normal_fight_unit.py',
+            'test_intensify.py',
+            'test_manual_scripts_guard.py',
+        ):
+            assert looks_like_misrenamed_manual_script(name) is None, (
+                f'{name} 不该被判为误改名'
             )
-            output = (proc.stdout + proc.stderr).decode('utf-8', errors='replace')
-            assert proc.returncode != 0, '误改名的实机脚本应导致收集失败'
-            assert 'build' in output, f'报错信息应指出原名 build.py, 实际:\n{output[:800]}'
-        finally:
-            fake.unlink(missing_ok=True)
+
+        # 原名 (无 test_ 前缀) 也不该被判
+        for name in sorted(MANUAL_E2E_SCRIPT_NAMES):
+            assert looks_like_misrenamed_manual_script(f'{name}.py') is None
+
+    def test_guard_hook_still_raises_on_real_path(self, tmp_path: Path) -> None:
+        """钩子在**真实路径**上仍必须抛 UsageError（不依赖列表判断）。"""
+        import pytest
+        from testing.conftest import pytest_collect_file
+
+        # 造一个 testing/ops 下的路径（只验证判定，不落盘）
+        fake = OPS_DIR / 'test_build.py'
+        with pytest.raises(pytest.UsageError, match='build'):
+            pytest_collect_file(fake, parent=None)
+
+        # 非 ops 目录不触发
+        assert pytest_collect_file(PROJECT_ROOT / 'testing' / 'ops_x' / 'test_build.py', None) is None
 
     def test_normal_collection_unaffected(self) -> None:
         """正常收集必须畅通无阻 (防护不能误伤)。"""

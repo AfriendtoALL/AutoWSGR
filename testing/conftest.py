@@ -52,6 +52,24 @@ MANUAL_E2E_SCRIPT_NAMES = frozenset({
 })
 
 
+def looks_like_misrenamed_manual_script(file_name: str) -> str | None:
+    """若 ``file_name`` 是被误改名的实机脚本, 返回原名; 否则 ``None``。
+
+    抽成独立函数而非只写在钩子里, 是为了让测试能**直接验证同一份判定逻辑**
+    而不必真的造文件跑子进程 —— 之前那个版本在项目目录里``shutil.copy``
+    出 ``test_build.py``, 进程被中断时 ``finally`` 来不及清理就会残留,
+    导致下一次全量跑直接收集失败 (2026-10-12 踩过)。
+    """
+    stem = Path(file_name).stem
+    for prefix in ('test_',):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix) :]
+            break
+    else:
+        return None
+    return stem if stem in MANUAL_E2E_SCRIPT_NAMES else None
+
+
 def pytest_collect_file(file_path: Path, parent):
     """拒绝收集被误改名的实机验证脚本。
 
@@ -63,26 +81,18 @@ def pytest_collect_file(file_path: Path, parent):
     if file_path.parent.name != 'ops':
         return None
 
-    # 去掉 test_ 前缀后还原原名, 如 test_build.py → build
-    stem = file_path.stem
-    for prefix in ('test_',):
-        if stem.startswith(prefix):
-            stem = stem[len(prefix) :]
-            break
-    else:
+    stem = looks_like_misrenamed_manual_script(file_path.name)
+    if stem is None:
         return None
 
-    if stem in MANUAL_E2E_SCRIPT_NAMES:
-        raise pytest.UsageError(
-            f'testing/ops/{file_path.name} 疑似被误改名的实机验证脚本'
-            f'(原名 {stem}.py), 不能作为 pytest 测试收集。\n'
-            f'pytest 收集它会尝试连接真实模拟器并失败。\n'
-            f'正确做法: 改回 {stem}.py; 若要补单元测试, 请新建 '
-            f'test_{stem}_unit.py 并用 mock 替代真机依赖。\n'
-            f'详见 testing/ops/README.md。'
-        )
-
-    return None
+    raise pytest.UsageError(
+        f'testing/ops/{file_path.name} 疑似被误改名的实机验证脚本'
+        f'(原名 {stem}.py), 不能作为 pytest 测试收集。\n'
+        f'pytest 收集它会尝试连接真实模拟器并失败。\n'
+        f'正确做法: 改回 {stem}.py; 若要补单元测试, 请新建 '
+        f'test_{stem}_unit.py 并用 mock 替代真机依赖。\n'
+        f'详见 testing/ops/README.md。'
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

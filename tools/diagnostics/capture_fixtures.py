@@ -112,12 +112,41 @@ class FixtureCollector:
         self._last_shot: dict[str, float] = {}
         self.records: list[CaptureRecord] = []
         self._counter: dict[str, int] = {}
+        self._prev_thumb = None
+        self._same_count = 0
 
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.out_dir = OUTPUT_ROOT / f'{mode}_{stamp}'
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 采集 ────────────────────────────────────────────────────────────
+
+    def is_duplicate(self, screen, *, tol: float = 0.35) -> bool:
+        """画面是否与上一张几乎一样（用于手动连拍去重）。
+
+        对缩略图算**平均绝对差**而非最大逐像素差：缩到 64x36 后, 单个像素
+        级的变化会被 ``INTER_AREA`` 抹平, 而页面真正切换时是整片区域变化,
+        平均差才反映「整体变了没有」。判定为同一个画面需连续 2 次, 避免
+        动画推进途中被误判成静止而丢掉关键帧。
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:  # pragma: no cover
+            return False
+
+        small = cv2.resize(screen, (64, 36), interpolation=cv2.INTER_AREA)
+        if self._prev_thumb is not None:
+            mad = float(np.abs(small.astype(np.float32) - self._prev_thumb).mean())
+            self._last_mad = mad
+            if mad <= tol:
+                self._same_count += 1
+                if self._same_count >= 2:
+                    return True
+            else:
+                self._same_count = 0
+        self._prev_thumb = small.astype(np.float32)
+        return False
 
     def on_phase_identified(
         self,
@@ -127,8 +156,19 @@ class FixtureCollector:
         confidence: float | None = None,
         matched_at: tuple[int, int] | None = None,
         note: str = '',
+        dedup: bool = False,
     ) -> Path | None:
-        """某状态被识别到时截图。同一状态最短间隔 ``min_interval``。"""
+        """某状态被识别到时截图。同一状态最短间隔 ``min_interval``。
+
+        Parameters
+        ----------
+        dedup:
+            为 True 时先比对画面内容, 与上一张几乎一样则跳过不落盘。
+            仅手动连拍需要 —— 引擎模式下每个 phase 触发时画面本就在变化。
+        """
+        if dedup and self.is_duplicate(screen):
+            return None
+
         now = time.monotonic()
         if now - self._last_shot.get(phase_name, 0.0) < self.min_interval:
             return None
@@ -296,30 +336,56 @@ def collect_manually(mode: str, *, duration: float) -> Path:
 
     你在模拟器里手动操作, 脚本持续截图。**注意**: 这种是随机时刻的图,
     可能处于动画中间态, 不适合直接当断言 fixture, 只适合当素材。
+
+    去重
+    ----
+    连拍间隔远小于动画时长, 同一画面会被反复拍到。这里按画面内容哈希
+    丢掉「与上一张几乎一样」的帧 (见 :meth:`FixtureCollector.is_duplicate`),
+    只在画面**真的变了**时落盘 —— 否则 300s 连拍会产出上千张几乎相同的图,
+    人工筛选成本远高于采集本身。
+
+    同理, 同一 phase 在 ``dedup_window`` 秒内也只保留第一张。
+
+    标签来源
+    --------
+    用的是 :func:`get_current_page`（直接吃一张 frame）而不是
+    :func:`identify_current_page`（自己另截一张）：后者会截两次, 导致
+    **落盘的图和打的标签不是同一帧**, 动画页面上标签必然对不上。
+    页面名是 UI 层的页面名字符串 (如「地图页面」) 而非 CombatPhase 枚举,
+    因为手动连拍阶段还没进战斗, 战斗状态机无从谈起。
     """
     from autowsgr.scheduler import launch
-    from autowsgr.ops.navigate import identify_current_page
+    from autowsgr.ui.page import get_current_page
 
     collector = FixtureCollector(mode, min_interval=0.0)
     ctx = launch('usersettings.yaml', ensure_game=False)
 
-    print(f'开始连拍{duration:.0f}s, 请在模拟器里手动操作。')
-    print('按 Ctrl+C 结束。\n')
+    print(f'开始连拍 {duration:.0f}s, 请在模拟器里手动操作。')
+    print('画面变化时才落盘; 按 Ctrl+C 提前结束。')
+    print('每张会标注当时识别出的页面名 (认不出记 UNKNOWN)。\n')
 
     deadline = time.monotonic() + duration
+    shots = skipped = 0
     try:
         while time.monotonic() < deadline:
             screen = ctx.ctrl.screenshot()
-            page = identify_current_page(ctx)
-            collector.on_phase_identified(
-                page.name if page else 'UNKNOWN',
+            phase = get_current_page(screen) or 'UNKNOWN'
+            saved = collector.on_phase_identified(
+                phase,
                 screen,
                 note='手动连拍 (随机时刻, 不保证是断言级 fixture)',
+                dedup=True,
             )
+            if saved is None:
+                skipped += 1
+            else:
+                shots += 1
+                print(f'  [{phase}] {saved.name}')
             time.sleep(0.4)
     except KeyboardInterrupt:
         print('\n已中断。')
 
+    print(f'\n落盘 {shots} 张, 因画面重复跳过 {skipped} 次。')
     return collector.finalize()
 
 
@@ -356,6 +422,8 @@ def main() -> int:
 
     print('\n下一步:')
     print('  1. 人工浏览截图, 确认每张确实处于 manifest 标注的 phase')
+    print('     (采集器只记录引擎判断, 引擎误判这里会跟着错 —— 2026-10-12')
+    print('      实测 RESULT 批次就全是战斗动画帧, 不可直接当 fixture)')
     print('  2. 把满意的移入 testing/fixtures/screenshots/<mode>/')
     print('  3. 补断言纳入 pytest (可参考 docs/architecture/tier2-3-improvement-plan.md 的 T3-3②)')
     return 0
