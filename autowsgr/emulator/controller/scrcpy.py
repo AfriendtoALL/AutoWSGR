@@ -38,9 +38,10 @@ from __future__ import annotations
 
 import struct
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
-from autowsgr.infra import EmulatorConfig, EmulatorConnectionError
+from autowsgr.infra import EmulatorConfig, EmulatorConnectionError, RepeatedActionError
 from autowsgr.infra.config import operation_delay
 from autowsgr.infra.logger import caller_info, get_logger
 
@@ -55,6 +56,14 @@ if TYPE_CHECKING:
     from adbutils import AdbDevice
 
 _log = get_logger('emulator')
+
+# ── 重复动作检测 (2026-10-12, 卡死诊断) ──
+#: 判定窗口(秒)：窗口内同坐标点击超过 REPEAT_LIMIT 次即判定界面无进展。
+#: 依据见 :meth:`ScrcpyController._note_action` 的 docstring。
+REPEAT_WINDOW_SECONDS = 10.0
+
+#: 窗口内允许的最大同坐标点击次数。
+REPEAT_LIMIT = 20
 
 # ── scrcpy 2.7 控制流协议常量 ──
 # 参考：scrcpy app/src/control_msg.h / control_msg.c (v2.7)
@@ -122,6 +131,10 @@ class ScrcpyController(AndroidController):
         self._resolution: tuple[int, int] = (0, 0)
         self._native_resolution: tuple[int, int] = (0, 0)
         self._stream: ScrcpyVideoStream | None = None
+
+        # 重复动作检测 (2026-10-12): 键=归一化坐标, 值=最近若干次点击的时间戳
+        self._recent_clicks: dict[tuple[float, float], deque[float]] = {}
+        self._last_click_caller = '<unknown>'
 
         # 加速通道 (connect() 中初始化; 未连接前为 None)
         self._nemu: 'NemuIpcCapture | None' = None
@@ -458,6 +471,8 @@ class ScrcpyController(AndroidController):
 
     # 引入一个开关，当参数为：click(x, y, delay=False) 时关闭延迟，该方法默认打开全局延迟，全局延迟可以在 config.py 内设置
     def click(self, x: float, y: float, *, delay: bool = True) -> None:
+        self._last_click_caller = caller_info()
+        self._note_action(x, y)
         w, h = self._resolution
         px, py = self._to_absolute(x, y)
         _log.debug(
@@ -474,6 +489,46 @@ class ScrcpyController(AndroidController):
 
         if delay:  # True 才走延迟
             time.sleep(operation_delay())
+
+    def _note_action(self, x: float, y: float) -> None:
+        """记录一次点击, 若同坐标短时间重复过多则抛 :class:`RepeatedActionError`。
+
+        为什么需要它
+        ------------
+        7x24 挂机有一种故障逃过了所有超时与熔断：**界面无进展但脚本仍在
+        按节奏重复点同一处**。实测（2026-10-11 用户手动关 MuMu，日志
+        ``logs/2026-10-11_08-28-24``）该坐标被点了 **123 次 / 持续 185 秒**，
+        而同一日志里其它坐标均只出现 1 次。
+
+        这类故障的特点是「进程活着、日志在写、但没有实际进展」，
+        ``screenshot_timeout`` 与调度器熔断都只处理「异常返回」，管不到它。
+
+        阈值依据
+        --------
+        ``REPEAT_WINDOW_SECONDS=10`` / ``REPEAT_LIMIT=20`` 即「10 秒内同坐标
+        超过 20 次」。正常操作的连击是**同一动作因等待轮询而重复**（如加速
+        点击，实测平均间隔 1.52s，10 秒内最多 ~7 次），留了约 3 倍余量；
+        而故障态是 10 秒内 ~20+ 次，两者不重叠。
+
+        只在**同一坐标**上计数：正常流程会点很多不同位置，故障才是死磕一处。
+        """
+        now = time.monotonic()
+        key = (round(x, 3), round(y, 3))
+        window = self._recent_clicks.get(key)
+        if window is None:
+            self._recent_clicks[key] = deque((now,), maxlen=REPEAT_LIMIT + 1)
+            return
+        window.append(now)
+        # 滑窗内计数（deque 只保留最近 REPEAT_LIMIT+1 个时间戳）
+        cutoff = now - REPEAT_WINDOW_SECONDS
+        recent = sum(1 for t in window if t >= cutoff)
+        if recent > REPEAT_LIMIT:
+            span = now - window[0]
+            raise RepeatedActionError(
+                f'同一坐标 ({x:.3f}, {y:.3f}) 在 {REPEAT_WINDOW_SECONDS:g}s 内被点击 '
+                f'{recent} 次（阈值 {REPEAT_LIMIT}，实际跨度 {span:.1f}s），'
+                f'判定界面无进展 —— 上次调用: {self._last_click_caller}'
+            )
 
     def swipe(
         self,

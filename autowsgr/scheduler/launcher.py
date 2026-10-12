@@ -32,6 +32,7 @@ from autowsgr.context import GameContext
 from autowsgr.emulator import AndroidController, ScrcpyController
 from autowsgr.infra import ConfigManager, UserConfig, resolve_ocr_gpu_enabled
 from autowsgr.infra.logger import get_logger, setup_logger
+from autowsgr.infra.stuck_watchdog import arm_stall_watchdog
 from autowsgr.vision import EasyOCREngine, OCREngine
 
 
@@ -88,6 +89,10 @@ class Launcher:
             save_images=os.getenv('AUTOWSGR_SAVE_IMAGES', '').lower() == 'true',
             channels=log_cfg.effective_channels or None,
         )
+        # 卡死诊断 (2026-10-12): 主线程停滞超阈值则 dump 调用栈。
+        # 与超时/熔断互补 —— 后两者只处理「异常返回」，管不了「进程活着
+        # 但界面无进展」。见 autowsgr/infra/stuck_watchdog.py。
+        arm_stall_watchdog(log_cfg.dir)
         ch_summary = log_cfg.effective_channels
         _log.info(
             '[Launcher] 日志初始化完成: level={}, 通道覆盖={}',
