@@ -166,18 +166,25 @@ class ScrcpyController(AndroidController):
         self._stream.open()
 
         # ── 加速通道初始化 (可选, 失败自动回退) ──
+        # 先解析一次 adb 路径给下面两个触控通道共用 (MaaTouch 需要它启动服务,
+        # 常驻 shell 需要它拉管道)。nemu 探测成功时会用安装目录覆盖为更精确的路径。
+        self._adb_path = self._resolve_adb_path()
+
         # nemu_ipc: 直读 MuMu 渲染共享内存 (实测 ~3ms vs 流链路 50-150ms)
         self._nemu: NemuIpcCapture | None = None
         try:
             import os as _os
+
             from .nemu_ipc import NemuIpcCapture, detect_mumu_folder
+
             folder = detect_mumu_folder()
             if folder is not None:
-                self._nemu = NemuIpcCapture(folder, self._serial or '', self._resolution)
-                # 顺便锁定 adb.exe (MaaTouch 需要)
+                # 先锁定 adb 路径再构造捕获器：捕获器构造可能失败，
+                # 若放在其后就会连带跳过 adb 覆盖（常驻 shell 又退化没了）。
                 adb_candidate = _os.path.join(folder, 'nx_main', 'adb.exe')
                 if _os.path.exists(adb_candidate):
                     self._adb_path = adb_candidate
+                self._nemu = NemuIpcCapture(folder, self._serial or '', self._resolution)
         except Exception as exc:
             self._nemu = None
             _log.info('[Emulator] nemu_ipc 不可用, 截图继续走 scrcpy 流: {}', exc)
@@ -191,7 +198,7 @@ class ScrcpyController(AndroidController):
             local = local if _os.path.exists(local) else None
             self._touch.attach_maatouch(
                 MaaTouchController(
-                    adb_path=self._adb_path or self._resolve_adb_path() or 'adb',
+                    adb_path=self._adb_path or 'adb',
                     serial=self._serial or '',
                     local_path=local,
                     screen_size=self._resolution,
@@ -204,9 +211,11 @@ class ScrcpyController(AndroidController):
         try:
             from .nemu_ipc import PersistentAdbShell
 
-            adb_path = self._resolve_adb_path()
+            adb_path = self._adb_path
             shell = PersistentAdbShell(adb_path, self._serial or '') if adb_path else None
             self._touch.attach_persistent_shell(shell)
+            if shell is not None:
+                _log.info('[Emulator] 常驻 shell 已就绪 (adb={})', adb_path)
         except Exception as exc:
             self._touch.attach_persistent_shell(None)
             _log.info('[Emulator] 常驻 shell 不可用, 点击继续走单次 adb: {}', exc)
@@ -222,11 +231,37 @@ class ScrcpyController(AndroidController):
         )
 
     def _resolve_adb_path(self) -> str | None:
-        """定位 adb.exe。"""
+        """定位 adb 可执行文件路径。
+
+        三级来源，按可靠性降序：
+
+        1. ``connect()`` 中从 MuMu 安装目录（nemu_ipc 探测）锁定的路径
+        2. 系统 PATH（``shutil.which('adb')``）
+        3. 注册表里的模拟器安装目录（:func:`_find_adb`，Windows）
+
+        第3 级是**必须的**：Windows 上 ``shutil.which('adb')`` 几乎总是返回
+        ``None``（adb 不在 PATH 里），此前只做第 2 级导致常驻 shell 通道恒不可用，
+        触控长期落在最慢的单次 ``adb input`` 上（约 70ms/次）。
+
+        找不到时返回 ``None``（由调用方决定降级），不抛异常 —— 这是
+        ``connect()`` 的可选加速路径，找不到 adb 不该阻断整个连接。
+        """
+        if self._adb_path:
+            return self._adb_path
+
         import shutil
 
-        return shutil.which('adb')
+        found = shutil.which('adb')
+        if found:
+            return found
 
+        try:
+            from ..detector import _find_adb
+
+            return _find_adb()
+        except Exception as exc:
+            _log.debug('[Emulator] 无法定位 adb: {}', exc)
+            return None
 
     def disconnect(self) -> None:
         serial = self._serial or 'auto'
