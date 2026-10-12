@@ -254,10 +254,15 @@ class CampaignRunner:
         time.sleep(0.25)  # 等待页面稳定
         page = BattlePreparationPage(self._ctx)
 
-        # 战役支援 (auto_set_support): 出征前一次性开启
+        # 战役支援 (auto_set_support): 无条件收敛到目标状态
         da = self._ctx.config.daily_automation
         if da is not None and da.auto_set_support:
             ensure_battle_support(self._ctx, enabled=True)
+        else:
+            # 必须显式收敛到关闭态 (2026-10-12 修复): 支援开关是游戏内的持久
+            # 状态, 上一轮开着或用户手动开过, 若这里不关就会一直带着支援打
+            # —— 白耗支援次数, 且 `auto_set_support: false` 配置形同虚设。
+            ensure_battle_support(self._ctx, enabled=False)
 
         # 血量检测与自动修理已移除: 我方血量统一视作正常
         ship_stats = [ShipDamageState.NORMAL] * 6

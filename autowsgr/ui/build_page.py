@@ -120,7 +120,34 @@ CLICK_DESTROY_CONFIRM_SELECT: tuple[float, float] = (0.915, 0.906)
 """解体 — 确认选择。"""
 
 CLICK_DESTROY_REMOVE_EQUIP: tuple[float, float] = (0.837, 0.646)
-"""解体 — 卸下装备复选框。"""
+"""解体 — 卸下装备复选框。
+
+坐标标定 (2026-10-12 实机截图差分): 复选框本体位于像素 x798-814 / y342-358,
+中心 (806, 351) → 归一化 (0.8396, 0.6505)。此处沿用旧值 (0.837, 0.646),
+偏差 3px 仍落在框内, 且点击有容错, 故不改以免影响既有实机行为。
+"""
+
+DESTROY_REMOVE_EQUIP_BOX: tuple[int, int, int, int] = (798, 342, 815, 359)
+"""解体 — 卸下装备复选框的像素包围盒 (x0, y0, x1, y1), 基于 960x540 实机截图标定。
+
+用于**状态检测**(而非点击): 勾选时框内有深色对勾线, 未勾选时框内是纯白,
+因此统计框内暗像素数量即可判定, 比单点取色更抗干扰 (见
+:meth:`BuildPage.is_destroy_remove_equip_enabled`)。
+"""
+
+DESTROY_REMOVE_EQUIP_DARK_LUM: int = 450
+"""卸下装备复选框内判定「有勾」的亮度阈值 (R+G+B 之和)。
+
+实测: 未勾选时框内均值 RGB≈(237,237,237) → 和≈711, 暗像素 0 个;
+勾选时对勾线 RGB≈(56,56,56) → 和≈168。450 处于两者之间, 余量充足。
+"""
+
+DESTROY_REMOVE_EQUIP_MIN_DARK_PIXELS: int = 12
+"""判定「已勾选」所需的最小暗像素数。
+
+实测勾选态 17x17 框内有 62 个暗像素、未勾选态 0 个。取 12 作为阈值:
+既能容忍抗锯齿/JPEG压缩导致的少量像素漂移, 又远低于勾选态的真实值。
+"""
 
 CLICK_DESTROY_CONFIRM: tuple[float, float] = (0.9, 0.9)
 """解体 — 解装确认按钮。"""
@@ -331,9 +358,62 @@ class BuildPage:
         self._ctrl.click(*CLICK_DESTROY_CONFIRM_SELECT)
 
     def destroy_toggle_remove_equip(self) -> None:
-        """解体标签 → 点击「卸下装备」复选框。"""
-        _log.info('[UI] 建造页面 (解体) → 卸下装备')
+        """解体标签 → 点击「卸下装备」复选框。**无条件切换**。
+
+        .. warning::
+            这是**盲切换** (不读状态), 仅供调试与 :meth:`ensure_remove_equip`
+            / :meth:`disable_remove_equip` 内部使用。业务流程请用后两者 ——
+            见 :meth:`is_destroy_remove_equip_enabled` 的说明。
+        """
+        _log.info('[UI] 建造页面 (解体) → 卸下装备 (切换)')
         self._ctrl.click(*CLICK_DESTROY_REMOVE_EQUIP)
+
+    @staticmethod
+    def is_destroy_remove_equip_enabled(screen: np.ndarray) -> bool:
+        """检测解体页「卸下装备」复选框是否已勾选。
+
+        实现方式: 截取复选框包围盒 (:data:`DESTROY_REMOVE_EQUIP_BOX`),
+        统计其中亮度低于 :data:`DESTROY_REMOVE_EQUIP_DARK_LUM` 的像素数,
+        达到 :data:`DESTROY_REMOVE_EQUIP_MIN_DARK_PIXELS` 即视为已勾选。
+
+        为什么统计暗像素数量而非取单点颜色
+        ----------------------------------
+        对勾是抗锯齿的斜线, 单点取色落在勾上/勾外结果会跳变;
+        而「框内有没有深色笔画」这个整体特征稳定得多
+        (实测勾选态 62 个暗像素 vs 未勾选态 0 个)。
+
+        坐标基于 960x540 实机截图标定; 其他分辨率下会退化, 返回 ``False``
+        (保守: 视为未勾选, 由调用方补一次点击)。
+        """
+        h, w = screen.shape[:2]
+        x0, y0, x1, y1 = DESTROY_REMOVE_EQUIP_BOX
+        # 分辨率不符时框会取错位置, 直接返回未勾选(保守), 不做无意义的像素统计
+        if x1 > w or y1 > h:
+            return False
+        crop = screen[y0:y1, x0:x1]
+        dark_count = int((crop.sum(axis=2) < DESTROY_REMOVE_EQUIP_DARK_LUM).sum())
+        return dark_count >= DESTROY_REMOVE_EQUIP_MIN_DARK_PIXELS
+
+    def ensure_remove_equip(self) -> None:
+        """确保「卸下装备」复选框处于**勾选**状态 (幂等)。"""
+        screen = self._ctrl.screenshot()
+        if self.is_destroy_remove_equip_enabled(screen):
+            _log.debug('[UI] 建造页面 (解体) → 卸下装备已勾选, 跳过')
+            return
+        self.destroy_toggle_remove_equip()
+
+    def disable_remove_equip(self) -> None:
+        """确保「卸下装备」复选框处于**未勾选**状态 (幂等)。
+
+        与 :meth:`ensure_remove_equip` 对称。业务逻辑必须用这两个而非
+        :meth:`destroy_toggle_remove_equip`, 否则残留的勾选态会生效 ——
+        见 :meth:`destroy_ships` 处的说明。
+        """
+        screen = self._ctrl.screenshot()
+        if not self.is_destroy_remove_equip_enabled(screen):
+            _log.debug('[UI] 建造页面 (解体) → 卸下装备未勾选, 跳过')
+            return
+        self.destroy_toggle_remove_equip()
 
     def destroy_confirm(self) -> None:
         """解体标签 → 点击「解装确认」。"""
@@ -509,9 +589,17 @@ class BuildPage:
         time.sleep(_step_delay)
         self.destroy_confirm_select()
         time.sleep(_step_delay)
+        # ── 无条件收敛「卸下装备」复选框 ──
+        # 该复选框是**游戏内的持久状态**, 不随页面切换重置。此前写成
+        # `if remove_equipment: toggle()` 有两个失效路径(2026-10-12 修复):
+        #   1. 连续两轮解装 → 第二轮把勾选**取消**掉 → 装备随舰船不可逆销毁;
+        #   2. 配置改为 False 但上一轮是 True → 残留勾选态生效, 配置被静默忽略。
+        # 必须无条件收敛到目标态, 且不能放在任何提前 return 之后。
         if remove_equipment:
-            self.destroy_toggle_remove_equip()
-            time.sleep(_step_delay)
+            self.ensure_remove_equip()
+        else:
+            self.disable_remove_equip()
+        time.sleep(_step_delay)
         self.destroy_confirm()
         time.sleep(_step_delay)
         self.destroy_four_star_confirm()
