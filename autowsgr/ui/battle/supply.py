@@ -13,9 +13,15 @@
 (:meth:`SupplyMixin.apply_supply` 读取):
 
 - ``'auto'``   : 勾选游戏内「自动补给」复选框，由游戏在出击时自动补给。
-- ``'script'`` : 脚本手动补给 —— 打开「快速补给」面板后点击「全部补给」按钮
-  (即 ``CLICK_SUPPLY_ALL``)。原逐舰船点击的补给规则已废弃，统一改为
-  点击右侧「全部补给」。
+- ``'script'`` : **先取消**游戏内「自动补给」勾选，再打开「快速补给」面板
+  点击「全部补给」按钮 (即 ``CLICK_SUPPLY_ALL``)。原逐舰船点击的补给规则已
+  废弃，统一改为点击右侧「全部补给」。
+
+⚠️ **两种模式都会每轮校正复选框状态** (2026-10-12 修复)：复选框是游戏内的
+持久状态，不随页面切换重置。此前 ``'script'`` 模式从不碰它，导致上一轮
+``'auto'`` 模式留下的勾选态持续生效 —— 脚本补完弹药后，出击时游戏再自动补
+一次，既白耗燃料，又让「按需补给」的语义彻底失效。详见
+:meth:`SupplyMixin.disable_auto_supply`。
 """
 
 from __future__ import annotations
@@ -92,6 +98,27 @@ class SupplyMixin(BaseBattlePreparation):
         _log.debug('[UI] 出征准备 → 勾选自动补给')
         self.toggle_auto_supply()
 
+    def disable_auto_supply(self) -> None:
+        """确保游戏内「自动补给」复选框处于**未勾选**状态。
+
+        与 :meth:`ensure_auto_supply` 对称，是脚本补给模式的**前置条件**。
+
+        为什么必须显式取消 (2026-10-12 用户指出)
+        ----------------------------------------
+        复选框是**游戏内的持久状态**，不随页面切换重置。若上一轮用了
+        ``'auto'`` 模式、或用户在游戏里手动勾选过，之后切到 ``'script'``
+        模式时复选框仍是勾选态 —— 此时脚本补完弹药，出击时游戏会
+        **再自动补给一次**，白白多耗燃料，且「按需补给」的语义彻底失效。
+
+        与 :meth:`ensure_auto_supply` 一样是幂等的：已是目标状态则不点击。
+        """
+        screen = self._ctrl.screenshot()
+        if not self.is_auto_supply_enabled(screen):
+            _log.debug('[UI] 出征准备 → 自动补给已关闭, 跳过')
+            return
+        _log.info('[UI] 出征准备 → 取消自动补给勾选 (脚本补给模式下必须关闭)')
+        self.toggle_auto_supply()
+
     def supply_all(self) -> None:
         """脚本手动补给: 打开「快速补给」面板并点击「全部补给」。
 
@@ -154,9 +181,23 @@ class SupplyMixin(BaseBattlePreparation):
     def apply_supply(self, *, mode: str | None = None) -> None:
         """按需补给——**任一舰船弹药全空**即补给 (2026-10-10 用户指令)。
 
-        先检测准备页的弹药子弹状态:
+        先把游戏内「自动补给」复选框调整到与 :paramref:`mode` 一致的状态,
+        再按需补给:
 
-        - 存在全空船 → 按补给方式执行补给 (全部补给会一并补满其他船);
+        - ``'auto'``   : 勾选游戏内自动补给复选框 (见 :meth:`ensure_auto_supply`),
+                        由游戏在出击时自动补给。
+        - ``'script'`` : **先取消**自动补给勾选 (见 :meth:`disable_auto_supply`),
+                        再按需点击「全部补给」。
+
+        为什么取消勾选必须在**判断是否需要补给之前**
+        -------------------------------------------
+        复选框是**游戏内的持久状态**, 不随页面切换重置。若不在每轮显式校正,
+        上一轮 ``'auto'`` 模式留下的勾选态会持续生效 —— 此时脚本补完弹药,
+        出击时游戏再自动补一次, 「按需补给」的语义彻底失效 (2026-10-12 用户指出)。
+
+        弹药检测 (:meth:`has_empty_ammo_ship`) 的三种结果:
+
+        - 存在全空船 → 执行补给 (全部补给会一并补满其他船);
         - 所有船尚有弹药 → 跳过补给并记 INFO 日志;
         - 检测失败 (状态未知) → **同样跳过补给** 并记 WARNING —— 用户约定
           (2026-10-08): 宁可漏补不可误补 (旧"未知即补给"兜底曾在 40% 弹药
@@ -168,10 +209,21 @@ class SupplyMixin(BaseBattlePreparation):
             显式指定补给方式，可选 ``'auto'`` / ``'script'``。缺省时读取配置
             :attr:`~autowsgr.infra.config.UserConfig.supply_mode`
             (默认 ``'script'``)。
-
-        - ``'auto'``   : 勾选游戏内自动补给复选框 (见 :meth:`ensure_auto_supply`)。
-        - ``'script'`` : 脚本手动点击快速补给 → 全部补给 (见 :meth:`supply_all`)。
         """
+        cfg = getattr(self._ctx, 'config', None)
+        resolved = mode or getattr(cfg, 'supply_mode', None) or SUPPLY_MODE_SCRIPT
+        if resolved != SUPPLY_MODE_AUTO and resolved != SUPPLY_MODE_SCRIPT:
+            _log.warning('[UI] 未知补给方式 {!r}, 回退为脚本补给', resolved)
+            resolved = SUPPLY_MODE_SCRIPT
+
+        # ── 先校正复选框状态 (幂等, 与弹药检测无关) ──
+        # 顺序很关键: 复选框是持久状态, 必须每轮校正, 否则残留的勾选态
+        # 会在出击时触发游戏的自动补给, 抵消脚本的按需补给。
+        if resolved == SUPPLY_MODE_AUTO:
+            self.ensure_auto_supply()
+        else:
+            self.disable_auto_supply()
+
         ammo_state = self.has_empty_ammo_ship()
         if ammo_state is False:
             _log.info('[UI] 无空弹药船, 跳过补给 (任一舰船弹药全空才补给)')
@@ -179,11 +231,7 @@ class SupplyMixin(BaseBattlePreparation):
         if ammo_state is None:
             _log.warning('[UI] 弹药状态未知 (未见子弹行), 跳过补给')
             return
-        cfg = getattr(self._ctx, 'config', None)
-        resolved = mode or getattr(cfg, 'supply_mode', None) or SUPPLY_MODE_SCRIPT
         if resolved == SUPPLY_MODE_AUTO:
-            self.ensure_auto_supply()
+            # 游戏会在出击时自动补给, 脚本不介入。
             return
-        if resolved != SUPPLY_MODE_SCRIPT:
-            _log.warning('[UI] 未知补给方式 {!r}, 回退为脚本补给', resolved)
         self.supply_all()

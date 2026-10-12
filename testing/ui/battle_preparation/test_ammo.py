@@ -235,11 +235,14 @@ def test_apply_supply_script_mode_clicks_all():
     with (
         patch.object(page, 'has_empty_ammo_ship', return_value=True),
         patch.object(page, 'ensure_auto_supply') as ensure,
+        patch.object(page, 'disable_auto_supply') as disable,
         patch.object(page, 'supply_all') as supply_all,
     ):
         page.apply_supply()
         supply_all.assert_called_once()
         ensure.assert_not_called()
+        # 脚本补给必须先取消游戏内自动补给（2026-10-12 修复）
+        disable.assert_called_once()
 
 
 def test_apply_supply_explicit_mode_override():
@@ -249,11 +252,141 @@ def test_apply_supply_explicit_mode_override():
     with (
         patch.object(page, 'has_empty_ammo_ship', return_value=True),
         patch.object(page, 'ensure_auto_supply') as ensure,
+        patch.object(page, 'disable_auto_supply') as disable,
         patch.object(page, 'supply_all') as supply_all,
     ):
         page.apply_supply(mode=SUPPLY_MODE_SCRIPT)
         supply_all.assert_called_once()
         ensure.assert_not_called()
+        disable.assert_called_once()
+
+
+# ─────────────────────────────────────────────
+# 自动补给复选框校正 (2026-10-12 用户指出的漏洞)
+# ─────────────────────────────────────────────
+#
+# 复选框是**游戏内的持久状态**, 不随页面切换重置。修复前 script 模式从不碰它,
+# 上一轮 auto 模式留下的勾选态会持续生效 → 脚本补完弹药, 出击时游戏再自动
+# 补一次, 「按需补给」语义彻底失效。
+
+
+def test_disable_auto_supply_toggles_when_on():
+    """复选框已勾选 → 必须点击取消。"""
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig())
+    with (
+        patch.object(page, 'is_auto_supply_enabled', return_value=True),
+        patch.object(page, 'toggle_auto_supply') as toggle,
+    ):
+        page.disable_auto_supply()
+        toggle.assert_called_once()
+
+
+def test_disable_auto_supply_skips_when_off():
+    """已是未勾选 → 不点击（幂等，避免每轮多余操作）。"""
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig())
+    with (
+        patch.object(page, 'is_auto_supply_enabled', return_value=False),
+        patch.object(page, 'toggle_auto_supply') as toggle,
+    ):
+        page.disable_auto_supply()
+        toggle.assert_not_called()
+
+
+def test_apply_supply_script_mode_disables_checkbox():
+    """核心回归：script 模式必须取消自动补给勾选。"""
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig(supply_mode=SUPPLY_MODE_SCRIPT))
+    with (
+        patch.object(page, 'has_empty_ammo_ship', return_value=True),
+        patch.object(page, 'disable_auto_supply') as disable,
+        patch.object(page, 'supply_all'),
+    ):
+        page.apply_supply()
+        disable.assert_called_once()
+
+
+def test_apply_supply_auto_mode_never_disables_checkbox():
+    """auto 模式下绝不能取消勾选（否则补给完全失效）。"""
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig(supply_mode=SUPPLY_MODE_AUTO))
+    with (
+        patch.object(page, 'has_empty_ammo_ship', return_value=True),
+        patch.object(page, 'ensure_auto_supply') as ensure,
+        patch.object(page, 'disable_auto_supply') as disable,
+    ):
+        page.apply_supply()
+        ensure.assert_called_once()
+        disable.assert_not_called()
+
+
+def test_apply_supply_script_disables_checkbox_even_when_no_supply_needed():
+    """**顺序关键**：即使弹药充足不补给，也必须校正复选框。
+
+    这正是漏洞的隐蔽之处 —— 旧逻辑在「无需补给」时提前 return,
+    残留的勾选态就会在出击时触发游戏自动补给。
+    """
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig(supply_mode=SUPPLY_MODE_SCRIPT))
+    with (
+        patch.object(page, 'has_empty_ammo_ship', return_value=False),
+        patch.object(page, 'disable_auto_supply') as disable,
+        patch.object(page, 'supply_all') as supply_all,
+    ):
+        page.apply_supply()
+        disable.assert_called_once()
+        supply_all.assert_not_called()
+
+
+def test_apply_supply_script_disables_checkbox_when_ammo_unknown():
+    """弹药状态未知时同样必须校正复选框（跳过补给 ≠ 跳过校正）。"""
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig(supply_mode=SUPPLY_MODE_SCRIPT))
+    with (
+        patch.object(page, 'has_empty_ammo_ship', return_value=None),
+        patch.object(page, 'disable_auto_supply') as disable,
+        patch.object(page, 'supply_all') as supply_all,
+    ):
+        page.apply_supply()
+        disable.assert_called_once()
+        supply_all.assert_not_called()
+
+
+def test_apply_supply_unknown_mode_falls_back_to_script():
+    """未知模式回退为 script —— 且回退后仍要取消勾选。"""
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig())
+    with (
+        patch.object(page, 'has_empty_ammo_ship', return_value=True),
+        patch.object(page, 'disable_auto_supply') as disable,
+        patch.object(page, 'supply_all') as supply_all,
+    ):
+        page.apply_supply(mode='garbage')
+        disable.assert_called_once()
+        supply_all.assert_called_once()
+
+
+def test_apply_supply_checkbox_corrected_before_ammo_check():
+    """校正必须发生在弹药检测**之前**（顺序不变量）。
+
+    用调用序列表记录，断言 disable 先于 has_empty_ammo_ship 被调用 ——
+    这样「无需补给」分支才不会绕过校正。
+    """
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig(supply_mode=SUPPLY_MODE_SCRIPT))
+    order: list[str] = []
+
+    with (
+        patch.object(page, 'disable_auto_supply', side_effect=lambda: order.append('disable')),
+        patch.object(
+            page, 'has_empty_ammo_ship', side_effect=lambda: order.append('check') or False
+        ),
+        patch.object(page, 'supply_all'),
+    ):
+        page.apply_supply()
+
+    assert order == ['disable', 'check'], f'校正应先于弹药检测, 实际: {order}'
 
 
 # ─────────────────────────────────────────────
