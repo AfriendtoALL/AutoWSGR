@@ -336,6 +336,20 @@ class ScrcpyVideoStream:
                     _log.warning('[Emulator] scrcpy 视频流异常: {}', exc)
                     self._alive = False
                 break
+            except BaseException as exc:
+                # ⚠️ 兜底: 解码库的异常类型**不在** (ConnectionError, OSError) 之内
+                # (实测 `av.FFmpegError` 不是 OSError 子类), 上面那个 except 捕不到,
+                # 会让本线程**静默死亡**而 `_alive` 仍是 True ——
+                # 结果是 screenshot() 永远返回过期帧, ensure_alive() 也认为健康,
+                # 表现为「界面卡住不动」而非报错, 极难排查。
+                # 任何未预料的异常都必须把 _alive 置否, 让上层走重连。
+                if self._alive:
+                    _log.opt(exception=True).warning(
+                        '[Emulator] scrcpy 解码线程异常 ({}), 标记视频流不可用',
+                        type(exc).__name__,
+                    )
+                    self._alive = False
+                break
 
     def _postprocess(self, rgb: np.ndarray) -> np.ndarray:
         """把解码帧高度补齐到设备真实分辨率（不变量1）。"""
