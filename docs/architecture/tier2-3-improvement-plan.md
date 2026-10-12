@@ -867,4 +867,4 @@ def test_recognizer(case, screen):
 | **缺陷修复**  | 常驻 adb shell 通道恒不可用 → swipe 延迟 250ms→0ms                                          | `ec44166`                     |
 | **T3-3②** | 5 张实机战斗页 fixture + 19 项断言 + 采集脚本时序修复                                              | `ff22a69`                     |
 
-全量测试：**1638 passed / 25 skipped**（第一梯队前1335→ T2-1 后 1356 → 今日 1638）。
+全量测试：**1689 passed / 25 skipped**（第一梯队前 1335 → T2-1 后 1356 → 2026-10-12 收尾 1689）。
