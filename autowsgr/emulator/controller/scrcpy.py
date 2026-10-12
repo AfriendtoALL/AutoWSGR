@@ -1,9 +1,12 @@
 """scrcpy 设备控制器 — 基于 adbutils + scrcpy-server 的实现。
 
-通过 scrcpy 协议获取 H264 视频流并解码为截图；触控（click/swipe/long_tap）、
-按键和文本输入通过 scrcpy 控制流（INJECT_TOUCH_EVENT / INJECT_KEYCODE /
-INJECT_TEXT）实现，延迟远低于 ``adb shell input``。仅应用启停、运行检测等
-非实时操作仍走 ADB。
+通过 scrcpy 协议获取 H264 视频流并解码为截图；按键与文本输入走 scrcpy
+控制流（INJECT_KEYCODE / INJECT_TEXT / SET_CLIPBOARD）以降低延迟。
+
+**触控（click/swipe/long_tap）例外**：MuMu 12 等模拟器内置的 scrcpy 服务不支持
+INJECT_TOUCH_EVENT，触控统一走 adb ``input`` 命令，并通过
+:class:`~autowsgr.emulator.controller.touch.TouchChannelChain` 做三级降级
+（MaaTouch → 常驻 shell → 单次 adb）。截图与应用启停仍走各自原有通道。
 
 使用方式::
 
@@ -31,6 +34,7 @@ from autowsgr.infra.logger import caller_info, get_logger
 
 from ..detector import _find_adb, detect_emulators, prompt_user_select, resolve_serial
 from .protocol import AndroidController, DeviceInfo
+from .touch import TouchChannelChain
 
 
 if TYPE_CHECKING:
@@ -79,8 +83,10 @@ class ScrcpyController(AndroidController):
     """基于 scrcpy 协议的 Android 设备控制器。
 
     截图通过 scrcpy-server 提供的 H264 视频流解码获得（30+ fps）；
-    触控（click/swipe/long_tap）、按键与文本输入通过 scrcpy 控制流实现，
-    相比 ``adb shell input`` 显著降低延迟。仅应用管理类操作仍走 ADB。
+    按键与文本输入通过 scrcpy 控制流实现，延迟低。触控（click/swipe/long_tap）
+    走 adb ``input`` 命令（MaaTouch 等模拟器的内置 scrcpy 服务不支持
+    INJECT_TOUCH_EVENT），由 :class:`TouchChannelChain` 三级降级提速。
+    仅应用管理类操作仍走 ADB。
 
     Parameters
     ----------
@@ -134,8 +140,8 @@ class ScrcpyController(AndroidController):
         # 加速通道 (connect() 中初始化; 未连接前为 None)
         self._nemu: 'NemuIpcCapture | None' = None
         self._adb_path: str | None = None
-        self._maatouch: 'MaaTouchController | None' = None
-        self._persistent_shell: 'PersistentAdbShell | None' = None
+        # 触控注入链 (MaaTouch → 常驻 shell → 单次 adb), 通道在 connect() 中挂载
+        self._touch = TouchChannelChain(device_provider=self._require_device)
 
     # ── 连接 ──
 
@@ -202,30 +208,33 @@ class ScrcpyController(AndroidController):
             self._nemu = None
             _log.info('[Emulator] nemu_ipc 不可用, 截图继续走 scrcpy 流: {}', exc)
         # MaaTouch: socket 流注入 (写入即注入 ~0ms, 断连写抛异常可感知)
-        self._maatouch = None
         try:
             import os as _os
+
             from .maatouch import MaaTouchController
+
             local = 'bin/MaaTouch/maatouch'
             local = local if _os.path.exists(local) else None
-            self._maatouch = MaaTouchController(
-                adb_path=self._adb_path or self._resolve_adb_path() or 'adb',
-                serial=self._serial or '',
-                local_path=local,
-                screen_size=self._resolution,
+            self._touch.attach_maatouch(
+                MaaTouchController(
+                    adb_path=self._adb_path or self._resolve_adb_path() or 'adb',
+                    serial=self._serial or '',
+                    local_path=local,
+                    screen_size=self._resolution,
+                )
             )
         except Exception as exc:
-            self._maatouch = None
+            self._touch.attach_maatouch(None)
             _log.info('[Emulator] MaaTouch 不可用, 点击走 persistent/adb: {}', exc)
         # 常驻 adb shell: 点击免进程开销 (实测提交 ~0ms vs 单次 70ms)
-        self._persistent_shell: PersistentAdbShell | None = None
         try:
             from .nemu_ipc import PersistentAdbShell
+
             adb_path = self._resolve_adb_path()
-            if adb_path:
-                self._persistent_shell = PersistentAdbShell(adb_path, self._serial or '')
+            shell = PersistentAdbShell(adb_path, self._serial or '') if adb_path else None
+            self._touch.attach_persistent_shell(shell)
         except Exception as exc:
-            self._persistent_shell = None
+            self._touch.attach_persistent_shell(None)
             _log.info('[Emulator] 常驻 shell 不可用, 点击继续走单次 adb: {}', exc)
 
         _log.info(
@@ -462,18 +471,7 @@ class ScrcpyController(AndroidController):
             except Exception:
                 pass
             self._nemu = None
-        if self._maatouch is not None:
-            try:
-                self._maatouch.close()
-            except Exception:
-                pass
-            self._maatouch = None
-        if self._persistent_shell is not None:
-            try:
-                self._persistent_shell.close()
-            except Exception:
-                pass
-            self._persistent_shell = None
+        self._touch.close()
 
         self._device = None
         self._resolution = (0, 0)
@@ -746,39 +744,13 @@ class ScrcpyController(AndroidController):
     # 截图（视频流）与按键（keycode）仍走 scrcpy 通道保持低延迟。
 
     def _adb_input(self, args: list[str], timeout: float = 10.0) -> None:
-        """注入触控事件。
+        """注入触控事件（转发到触控通道链）。
 
-        优先级: MaaTouch (socket 流注入, 仅 tap) → 常驻 shell 会话 → 单次
-        adb input。每级失败自动降级到下一级。
+        实现见 :class:`~autowsgr.emulator.controller.touch.TouchChannelChain`：
+        MaaTouch (socket 流注入, 仅 tap) → 常驻 shell 会话 → 单次 adb input，
+        每级失败自动永久降级到下一级。
         """
-        if self._maatouch is not None and args[0] == 'tap':
-            try:
-                self._maatouch.click(int(args[1]), int(args[2]))
-                return
-            except Exception as exc:
-                _log.warning(
-                    '[Emulator] MaaTouch 持续失败, 降级 persistent/adb: {}', exc)
-                try:
-                    self._maatouch.close()
-                except Exception:
-                    pass
-                self._maatouch = None
-        if self._persistent_shell is not None:
-            try:
-                self._persistent_shell.run(*args)
-                return
-            except Exception as exc:
-                _log.warning('[Emulator] 常驻 shell 持续失败, 回退单次 adb: {}', exc)
-                try:
-                    self._persistent_shell.close()
-                except Exception:
-                    pass
-                self._persistent_shell = None
-        dev = self._require_device()
-        try:
-            dev.shell(['input', *args], timeout=timeout)
-        except Exception as exc:
-            _log.warning('[Emulator] adb input {} 失败: {}', args, exc)
+        self._touch.inject(args, timeout)
 
     # 引入一个开关，当参数为：click(x, y, delay=False) 时关闭延迟，该方法默认打开全局延迟，全局延迟可以在 config.py 内设置
     def click(self, x: float, y: float, *, delay: bool = True) -> None:

@@ -22,10 +22,13 @@
 
 from .protocol import AndroidController, DeviceInfo
 from .scrcpy import ScrcpyController
+from .touch import TouchChannelChain, TouchInjector
 
 
 __all__ = [
     'AndroidController',
     'DeviceInfo',
     'ScrcpyController',
+    'TouchChannelChain',
+    'TouchInjector',
 ]
