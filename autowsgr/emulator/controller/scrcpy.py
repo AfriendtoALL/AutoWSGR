@@ -17,6 +17,21 @@ INJECT_TOUCH_EVENT，触控统一走 adb ``input`` 命令，并通过
     screen = ctrl.screenshot()
     ctrl.click(0.5, 0.5)
     ctrl.disconnect()
+
+分层结构（T3-1 拆分后）
+--------------------
+本类只保留**业务语义**（截图/点击/按键/文本/应用管理）与编排，四种底层机制
+各自独立成模块，互不依赖：
+
+===========================  ==========================================
+模块                          职责
+===========================  ==========================================
+:mod:`.adb_conn`              serial 解析、adb server 重启、3 次重试接入
+:mod:`.video_stream`          scrcpy server 部署、建流、H264 解码、自动重连
+:mod:`.touch`                 触控三级降级链（MaaTouch → 常驻 shell → adb）
+:mod:`.protocol`              :class:`AndroidController` 抽象接口
+:mod:`.nemu_ipc`              MuMu 渲染共享内存直读（截图加速旁路）
+===========================  ==========================================
 """
 
 from __future__ import annotations
@@ -29,7 +44,7 @@ from autowsgr.infra import EmulatorConfig, EmulatorConnectionError
 from autowsgr.infra.config import operation_delay
 from autowsgr.infra.logger import caller_info, get_logger
 
-from ..detector import _find_adb, detect_emulators, prompt_user_select, resolve_serial
+from .adb_conn import AdbDeviceConnector, SerialResolver
 from .protocol import AndroidController, DeviceInfo
 from .touch import TouchChannelChain
 from .video_stream import ScrcpyVideoStream
@@ -118,24 +133,14 @@ class ScrcpyController(AndroidController):
 
     def connect(self) -> DeviceInfo:
         # ── serial 解析 ──
-        if self._serial:
-            resolved = self._serial
-        elif self._config is not None:
-            resolved = resolve_serial(self._config)
-        else:
-            candidates = detect_emulators()
-            if len(candidates) == 1:
-                resolved = candidates[0].serial
-                _log.info('[Emulator] 自动检测到唯一设备: {}', candidates[0].description)
-            elif len(candidates) == 0:
-                resolved = ''
-            else:
-                resolved = prompt_user_select(candidates)
+        resolved = SerialResolver(self._serial, self._config).resolve()
         self._serial = resolved or None
 
         # ── 连接 adbutils 设备 ──
-        self._connect_adb_device(resolved)
-        assert self._device is not None
+        self._device = AdbDeviceConnector.connect(resolved)
+        if not resolved:
+            # 未指定设备时按发现的第一台回填 serial（历史行为）
+            self._serial = self._device.serial
 
         # ── 获取初始分辨率 ──
         wsize = self._device.window_size()
@@ -218,61 +223,9 @@ class ScrcpyController(AndroidController):
 
     def _resolve_adb_path(self) -> str | None:
         """定位 adb.exe。"""
-        import os
         import shutil
-        found = shutil.which('adb')
-        if found:
-            return found
-        return None
 
-    def _connect_adb_device(self, serial: str | None) -> None:
-        """通过 adbutils 连接设备。"""
-        import adbutils
-
-        def _try_connect() -> None:
-            if serial:
-                # TCP 地址（如 127.0.0.1:16384）需先 adb connect
-                if ':' in serial:
-                    adbutils.adb.connect(serial, timeout=5.0)
-                self._device = adbutils.adb.device(serial=serial)
-            else:
-                devices = adbutils.adb.device_list()
-                if not devices:
-                    raise EmulatorConnectionError('未发现已连接的 ADB 设备')
-                self._device = devices[0]
-                self._serial = self._device.serial
-
-        max_attempts = 3
-        last_exc: Exception | None = None
-        for attempt in range(1, max_attempts + 1):
-            try:
-                if attempt > 1:
-                    _log.info('[Emulator] 重试连接 ({}/{})...', attempt, max_attempts)
-                    self._restart_adb_server()
-                    time.sleep(2.0)
-
-                _try_connect()
-            except Exception as exc:
-                last_exc = exc
-                _log.warning('[Emulator] 连接失败 (尝试 {}/{}): {}', attempt, max_attempts, exc)
-            else:
-                return
-
-        raise EmulatorConnectionError(
-            f'连接设备失败（共尝试 {max_attempts} 次）: {self._serial}'
-        ) from last_exc
-
-    def _restart_adb_server(self) -> None:
-        """重启 adb server。"""
-        import subprocess
-
-        try:
-            adb = _find_adb()
-            subprocess.run([adb, 'kill-server'], timeout=5, capture_output=True, check=False)  # noqa: S603
-            time.sleep(1)
-            subprocess.run([adb, 'start-server'], timeout=8, capture_output=True, check=False)  # noqa: S603
-        except Exception as exc:
-            _log.debug('[Emulator] 重启 adb server 失败: {}', exc)
+        return shutil.which('adb')
 
 
     def disconnect(self) -> None:

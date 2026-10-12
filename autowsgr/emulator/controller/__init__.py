@@ -20,15 +20,20 @@
     ctrl.disconnect()
 """
 
+from .adb_conn import AdbDeviceConnector, SerialResolver
 from .protocol import AndroidController, DeviceInfo
 from .scrcpy import ScrcpyController
 from .touch import TouchChannelChain, TouchInjector
+from .video_stream import ScrcpyVideoStream
 
 
 __all__ = [
+    'AdbDeviceConnector',
     'AndroidController',
     'DeviceInfo',
     'ScrcpyController',
+    'ScrcpyVideoStream',
+    'SerialResolver',
     'TouchChannelChain',
     'TouchInjector',
 ]
