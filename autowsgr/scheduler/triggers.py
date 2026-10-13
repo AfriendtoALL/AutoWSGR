@@ -49,6 +49,18 @@ _DONE_FLAGS = {
     ConditionFlag.SL,
 }
 
+#: 连续多少场 ``SKIP_FIGHT`` 判定为「空转」(2026-10-13)。
+#:
+#: 场景：计划要求白名单节点 (如 ``selected_nodes: [C]``)，但编队不满足
+#: 带路条件 → 实际进入 B 点 → 白名单未命中 → 撤退 → 再出征 → 再撤退。
+#: 此类循环**逃过现有全部三道防线**（见 ``NormalFightPlan.disabled_reason``
+#: 与测试 ``testing/scheduler/test_idle_loop.py`` 的说明）。
+#:
+#: 取 10 的依据：白名单撤退本身是正常行为（试错/绕路），偶发几次不算异常；
+#: 按每场约 2~3 分钟估算，10 次 ≈ 20~30 分钟后报警。比熔断阈值 5 更宽，
+#: 因为熔断针对的是「报错」，而这里针对的是「没报错但没进展」。
+IDLE_LOOP_THRESHOLD = 10
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 基类
@@ -283,6 +295,24 @@ class NormalFightPlan:
     completed: int = 0
     results: list[CombatResult] = field(default_factory=list)
 
+    consecutive_skips: int = 0
+    """连续「白名单撤退」(``SKIP_FIGHT``) 的场次计数。
+
+    任意非 ``SKIP_FIGHT`` 的结果都会归零 —— 包括 ``ACTION_FAILED``
+    (它由熔断负责，不在此重复计)。
+    """
+
+    skip_nodes: dict[str, int] = field(default_factory=dict)
+    """连续撤退期间各节点累计次数 (运行时: 仅诊断用)。成功一场即清空。"""
+
+    disabled_reason: str | None = None
+    """非 ``None`` 表示该 plan 已因空转被停用，不再产出任务。
+
+    会话级 (``reset()`` 不清除)：根因是配置错误 (如编队不满足带路条件)，
+    跨日不会自动缓解，须人工修正后重启脚本 —— 与 ``_dock_full_stopped``
+    语义一致。
+    """
+
 
 class NormalFightTrigger(Trigger):
     """常规战触发器: 多 plan 列表 + 全局上限, 空闲填充 (priority 最低)。
@@ -354,15 +384,32 @@ class NormalFightTrigger(Trigger):
         )
 
     def _has_plan(self) -> bool:
-        """是否有可产出的 plan (无副作用, 供耗尽判断用)。"""
-        return any(plan.target is None or plan.completed < plan.target for plan in self._plans)
+        """是否有可产出的 plan (无副作用, 供耗尽判断用)。
+
+        已因空转停用的 plan (``disabled_reason`` 非空) 不计入 —— 否则
+        ``_is_exhausted`` 会误判「还有活可干」，让调度器一直空转等待。
+        """
+        return any(
+            plan.disabled_reason is None
+            and (plan.target is None or plan.completed < plan.target)
+            for plan in self._plans
+        )
 
     def _pick_plan(self) -> NormalFightPlan | None:
-        """选下一个 plan: 优先未完成的有 target 的; 再轮询无限的。"""
+        """选下一个 plan: 优先未完成的有 target 的; 再轮询无限的。
+
+        跳过已因空转停用的 plan（``disabled_reason`` 非空）。
+        """
         for plan in self._plans:
+            if plan.disabled_reason is not None:
+                continue
             if plan.target is not None and plan.completed < plan.target:
                 return plan
-        unlimited = [p for p in self._plans if p.target is None]
+        unlimited = [
+            p
+            for p in self._plans
+            if p.target is None and p.disabled_reason is None
+        ]
         if unlimited:
             plan = unlimited[self._round_robin % len(unlimited)]
             self._round_robin += 1
@@ -386,6 +433,7 @@ class NormalFightTrigger(Trigger):
             return
         # 记录全部场次结果 (含未达标场), 供调用方 (如 run_yaml_plan) 统计
         self._current.results.append(result)
+        self._track_idle_loop(self._current, result)
         # 仅成功打完一场才计数 (对齐 classic: SUCCESS/SL 才算);
         # 配置 conditions 的 plan 还须战果全部达标 — 不达标的场次 (如 SL
         # 重开、评级不足) 不计入, 触发器下轮继续产出直到达标次数打满。
@@ -426,6 +474,54 @@ class NormalFightTrigger(Trigger):
                 '[Trigger] {} 船坞已满且无法解装, 常规战停止 (清船/解装后重启脚本)',
                 self.name,
             )
+
+    def _track_idle_loop(self, plan: NormalFightPlan, result: CombatResult) -> None:
+        """空转检测：连续多场白名单撤退且零成功 → 停用该 plan 并报根因。
+
+        为什么需要它（2026-10-13 用户实机反馈）
+        ----------------------------------------
+        用户的 5-2 计划要求白名单 ``[C]``，但默认编队不满足带路条件，
+        舰队实际进入 ``B`` 点 → 撤退 → ``SKIP_FIGHT`` → 再出征 → 无限循环。
+        三道现有防线**全部漏掉**：
+
+        1. ``max_steps``：``CombatEngine._reset()`` 每场清零，而每场只走 ~5 步；
+        2. 熔断：``SKIP_FIGHT`` 刻意不算失败（正常资源信号）；
+        3. 停滞检测：每场点不同坐标，不满足「同坐标」前提。
+
+        于是 ``completed`` 永不增长、触发器无限产出 —— 本方法补这一类
+        **「无异常、只是无进展」**的循环。
+
+        判据刻意比熔断（连续失败 5 次）更宽：白名单撤退本身是正常行为，
+        偶发几次（试错、绕路）不该报警；只有**持续且零成功**才是问题。
+        """
+        if result.flag is not ConditionFlag.SKIP_FIGHT:
+            # 任意其它结果都中断「连续」计数（含 ACTION_FAILED: 它归熔断管，
+            # 此处不重复计，避免同一次故障被双重惩罚）
+            plan.consecutive_skips = 0
+            plan.skip_nodes.clear()
+            return
+
+        plan.consecutive_skips += 1
+        for event in result.history.events:
+            if event.action == '撤退':
+                plan.skip_nodes[event.node] = plan.skip_nodes.get(event.node, 0) + 1
+
+        if plan.consecutive_skips < IDLE_LOOP_THRESHOLD:
+            return
+
+        nodes = ', '.join(f'{n} 点 {c} 次' for n, c in sorted(plan.skip_nodes.items()))
+        plan.disabled_reason = (
+            f'连续 {plan.consecutive_skips} 场白名单撤退且无一次成功 '
+            f'(撤退节点: {nodes or "未知"}) —— '
+            f'疑似编队不满足带路条件, 请核对该关卡对舰队编成/舰种/航速的要求, '
+            f'或确认 selected_nodes 与计划目标一致'
+        )
+        _log.error(
+            '[Trigger] {} {} 空转判定, 已停止该计划: {}',
+            self.name,
+            plan.name,
+            plan.disabled_reason,
+        )
 
     def reset(self) -> None:
         for plan in self._plans:
