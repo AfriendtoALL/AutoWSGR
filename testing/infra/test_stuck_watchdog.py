@@ -81,9 +81,14 @@ class TestRepeatDetection:
         # 不抛即通过
 
     def test_long_same_coord_click_raises(self, ctrl, clock) -> None:
-        """同坐标持续点击超过阈值 → 抛异常。"""
+        """同坐标持续点击超过阈值 → 抛异常。
+
+        步数按阈值推导（不写死），这样调整阈值时测试仍有效 ——
+        写死步数会让阈值一变测试就失去意义。
+        """
+        steps = int(REPEAT_STUCK_SECONDS) + 5
         with pytest.raises(RepeatedActionError):
-            for _ in range(100):
+            for _ in range(steps):
                 ctrl.click(0.26, 0.963, delay=False)
                 clock['t'] += 1.0
 
@@ -112,34 +117,41 @@ class TestRepeatDetection:
     def test_exception_carries_last_caller(self, ctrl, clock) -> None:
         """异常信息应带调用来源，便于定位是哪段逻辑在死磕。"""
         ctrl._last_click_caller = 'combat/actions.py:211 in click_speed_up'
+        steps = int(REPEAT_STUCK_SECONDS) + 5
         with pytest.raises(RepeatedActionError, match='click_speed_up'):
-            for _ in range(100):
+            for _ in range(steps):
                 ctrl._note_action(0.26, 0.963)
                 clock['t'] += 1.0
 
-    def test_threshold_covers_real_incident_not_normal_poll(self) -> None:
-        """阈值必须夹在「正常轮询时长」与「真实故障时长」之间。
+    def test_threshold_exceeds_longest_legitimate_wait(self) -> None:
+        """阈值必须大于**所有**合法等待中最长的那个。
 
-        正常轮询最长约 30s（状态机超时会自行退出）；
-        真实故障 185.4s。阈值 60s 居中，两侧都有余量。
+        战斗层最长状态超时是 ``NIGHT_PROMPT`` 150s（其次 RESULT 90s）。
+        60s 原阈值低于 150s —— 会把「等待夜战提示动画」误判成故障
+        （2026-10-13 用户实机反馈证实）。这是本条断言存在的意义。
         """
-        normal_poll_seconds = 30.0
-        real_incident_seconds = 185.4
-        assert normal_poll_seconds < REPEAT_STUCK_SECONDS < real_incident_seconds, (
-            f'阈值 {REPEAT_STUCK_SECONDS} 未落在 ({normal_poll_seconds}, '
-            f'{real_incident_seconds}) 区间内'
+        from autowsgr.combat.recognizer import PHASE_SIGNATURES
+
+        longest = max(s.default_timeout for s in PHASE_SIGNATURES.values())
+        assert REPEAT_STUCK_SECONDS > longest, (
+            f'阈值 {REPEAT_STUCK_SECONDS} 未超过最长合法等待 {longest}s, 会误报'
         )
 
-    def test_threshold_is_far_above_measured_poll_burst(self) -> None:
-        """按实测速率换算：正常轮询即使打满 30s 也远不到阈值。
+    def test_threshold_matches_known_real_incident(self) -> None:
+        """阈值必须**略低于**已知真实故障时长（否则检测形同虚设）。
 
-        实测最高 66 次/10 秒 → 折算 30s 约 198 次，
-        而持续 30s 远小于 60s 阈值 —— 证明「用时长而非速率」的必要性。
+        实测 185.4s（2026-10-11，123 次/同坐标）。阈值 180s 仍在其下方，
+        故该故障仍能捕获 —— 但余量只有 5.4s，属「贴着样本」的临界值。
+        若今后发现漏报，应上调；若为了消除误报而下调，则本断言会失败
+        并提醒重新设计判据。
         """
-        measured_burst_per_10s = 66
-        over_30s = measured_burst_per_10s * 3
-        assert over_30s > 100, '样本量应足够大, 换算才有意义'
-        assert 30.0 < REPEAT_STUCK_SECONDS, '时长判据下, 30s 的正常轮询不触发'
+        real_incident_seconds = 185.4
+        assert REPEAT_STUCK_SECONDS < real_incident_seconds, (
+            f'阈值 {REPEAT_STUCK_SECONDS} 已不低于实测故障 {real_incident_seconds}s, '
+            f'该故障将检测不到 —— 需改判据而非单纯调阈值'
+        )
+        margin = real_incident_seconds - REPEAT_STUCK_SECONDS
+        assert margin > 0, '阈值必须留有触发余量' 
 
 
 # ══════════════════════════════════════════════
