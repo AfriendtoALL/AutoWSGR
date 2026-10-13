@@ -10,7 +10,7 @@
 
 本次加入两道护栏 (对标 Alas device.py 的 stuck_timer 双计时器):
 - ``max_recovery_attempts`` 封住恢复死循环
-- ``max_steps`` 封住「识别成功但页面不推进」的死循环
+- (原 ``max_steps`` 已移除, 2026-10-13; 改由触发器层空转检测与各状态超时覆盖)
 
 覆盖:
 - 恢复次数上限: 超限判 SL, 不再无限 continue
@@ -30,7 +30,6 @@ import pytest
 
 from autowsgr.combat.engine import (
     DEFAULT_MAX_RECOVERY_ATTEMPTS,
-    DEFAULT_MAX_STEPS,
     CombatEngine,
 )
 from autowsgr.combat.history import CombatResult
@@ -297,86 +296,6 @@ class TestSLCallbackInjection:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 护栏 2: 步数上限
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-class TestStepCap:
-    """识别始终成功但页面不推进时, 步数上限必须兜底退出。"""
-
-    def test_step_loop_terminates_with_sl(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """核心回归: _step 永远返回 FIGHT_CONTINUE (状态机原地打转)。
-
-        修复前这是另一个无界循环 (与恢复死循环不同, 这条根本不经过
-        ``except`` 分支)。现在应在 ``max_steps`` 步后判 SL。
-        """
-        _patch_no_sleep(monkeypatch)
-
-        engine = _make_engine(max_steps=25)
-        _stub_fight_setup(monkeypatch, engine)
-
-        monkeypatch.setattr(
-            engine,
-            '_step',
-            MagicMock(return_value=ConditionFlag.FIGHT_CONTINUE),
-        )
-
-        result = engine.fight(_make_plan(), initial_ship_stats=None)
-
-        assert result.flag is ConditionFlag.SL
-        assert engine._steps == 26  # 上限 25, 第 26 步触发
-
-    def test_step_cap_not_tripped_by_normal_battle(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """正常战斗 (12 步) 远低于默认上限, 护栏不得误触发。"""
-        _patch_no_sleep(monkeypatch)
-
-        engine = _make_engine()  # 默认 200 步上限
-        _stub_fight_setup(monkeypatch, engine)
-
-        sequence = [ConditionFlag.FIGHT_CONTINUE] * 11 + [ConditionFlag.FIGHT_END]
-        monkeypatch.setattr(engine, '_step', MagicMock(side_effect=sequence))
-
-        result = engine.fight(_make_plan(), initial_ship_stats=None)
-
-        assert result.flag is ConditionFlag.OPERATION_SUCCESS
-        assert engine._steps == 12
-
-    def test_step_counter_resets_between_fights(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """计数器在每次 fight() 开头重置 —— 引擎实例可复用于多场战斗。
-
-        调度器复用同一引擎打多轮时, 若不重置, 第二场会带着第一场的步数
-        开跑, 累积到上限后被误判 SL。
-        """
-        _patch_no_sleep(monkeypatch)
-
-        engine = _make_engine(max_steps=100)
-        _stub_fight_setup(monkeypatch, engine)
-
-        # 第一场: 走 10 步后结束
-        first = [ConditionFlag.FIGHT_CONTINUE] * 9 + [ConditionFlag.FIGHT_END]
-        monkeypatch.setattr(engine, '_step', MagicMock(side_effect=first))
-        r1 = engine.fight(_make_plan(), initial_ship_stats=None)
-        assert r1.flag is ConditionFlag.OPERATION_SUCCESS
-        assert engine._steps == 10
-
-        # 第二场: 同样的 10 步应同样成功 (而非因累计 20 步而异常)
-        monkeypatch.setattr(
-            engine,
-            '_step',
-            MagicMock(side_effect=[ConditionFlag.FIGHT_CONTINUE] * 9 + [ConditionFlag.FIGHT_END]),
-        )
-        r2 = engine.fight(_make_plan(), initial_ship_stats=None)
-        assert r2.flag is ConditionFlag.OPERATION_SUCCESS
-        assert engine._steps == 10
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # 默认值与可配置性
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -385,31 +304,28 @@ class TestCircuitBreakerDefaults:
     """护栏默认值与构造参数覆盖。"""
 
     def test_defaults_are_sane(self) -> None:
-        """默认值需覆盖正常战斗 (8~14 步/节点) 且留足余量。"""
-        assert DEFAULT_MAX_STEPS >= 50
+        """恢复次数上限默认值应留足余量（步数上限已移除, 见引擎注释）。"""
         assert 1 <= DEFAULT_MAX_RECOVERY_ATTEMPTS <= 5
 
     def test_engine_uses_defaults(self) -> None:
         engine = _make_engine()
-        assert engine._max_steps == DEFAULT_MAX_STEPS
         assert engine._max_recovery_attempts == DEFAULT_MAX_RECOVERY_ATTEMPTS
 
     def test_overrides_take_effect(self) -> None:
-        engine = _make_engine(max_steps=7, max_recovery_attempts=2)
-        assert engine._max_steps == 7
+        engine = _make_engine(max_recovery_attempts=2)
         assert engine._max_recovery_attempts == 2
 
     def test_stop_request_still_exits_immediately(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """停止请求必须立刻退出, 不受步数上限影响 (用户按 Ctrl+C 要能马上停)。
+        """停止请求必须立刻退出 (用户按 Ctrl+C 要能马上停)。
 
-        注意此��� FIGHT_END 而非 SL —— 战斗引擎把「主动停止」当作正常结束,
+        注意此处是 FIGHT_END 而非 SL —— 战斗引擎把「主动停止」当作正常结束,
         由上层 ops 决定如何计入统计。
         """
         from autowsgr.combat.recognizer import CombatStopRequestedError
 
-        engine = _make_engine(max_steps=1)  # 上限极低, 用于验证不被触发
+        engine = _make_engine()
         _stub_fight_setup(monkeypatch, engine)
 
         monkeypatch.setattr(

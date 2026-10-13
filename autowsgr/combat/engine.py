@@ -39,13 +39,15 @@ _log_sm = get_logger('combat.engine')  # 状态机转移专用，可单独静默
 # 状态机的三种"卡死"形态，都必须能被确定性终止，不能靠 while 自身的
 # 退出条件碰运气：
 #   1. 识别超时 → 恢复成功 → 继续后又超时  →  恢复死循环
-#   2. 识别始终成功 → 但页面不再推进     →  步数死循环
-#   3. 节点追踪失败 → 反复撤退           →  由步数上限兜底
+#   2. 识别始终成功 → 但页面不再推进     →  见下方「步数限制已移除」
+#   3. 节点追踪失败 → 反复撤退           →  由触发器层「空转检测」兜底
 #
 # Alas 的对应机制是 device.py 里的 stuck_timer（60s/180s 双计时器，
 # 超时打印完整调用栈再 raise GameStuckError）。此处移植其**思路**：
 #   - ``max_recovery_attempts`` 封住 (1)
-#   - ``max_steps`` 封住 (2)(3)
+#   - (2) 的步数上限**已移除**（2026-10-13, 见 DEFAULT_MAX_RECOVERY_ATTEMPTS 下方）
+#   - (3) 改由 ``NormalFightTrigger._track_idle_loop`` 在**跨场**层面兜底：
+#     实测步数上限对 (3) 本就无效 —— 它每场清零，而反复撤退每场只走约 5 步
 #   - 触发时 log 里带上节点/阶段/步数，便于事后定位
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -56,20 +58,6 @@ DEFAULT_MAX_RECOVERY_ATTEMPTS = 3
 RESULT 90s、NIGHT_PROMPT 150s），三次恢复 ≈ 最多约 1 分钟额外开销，
 换��确定退出，代价可接受。
 """
-
-DEFAULT_MAX_STEPS = 200
-"""单场战斗的最大状态机步数。
-
-正常一次节点战斗约 8~14 步（行军→战况→索敌→阵型→导弹→战斗→夜战→战果→
-经验→掉落→前进）。``selected_nodes`` 有3 点时约 40 步，留 5 倍余量到 200。
-超限说明页面反复横跳或节点判定失效，属异常而非正常流程。
-"""
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 战斗引擎
-# ═══════════════════════════════════════════════════════════════════════════════
-
 
 class CombatEngine(PhaseHandlersMixin):
     """自包含的战斗状态机引擎。
@@ -86,8 +74,6 @@ class CombatEngine(PhaseHandlersMixin):
     max_recovery_attempts:
         单场战斗内允许的连续恢复次数上限，超过则判 SL。默认
         :data:`DEFAULT_MAX_RECOVERY_ATTEMPTS`。
-    max_steps:
-        单场战斗内允许的状态机步数上限。默认 :data:`DEFAULT_MAX_STEPS`。
     on_sl:
         战斗需 SL 重开整局时的恢复动作 (通常由 ops 层注入
         ``restart_game``)。
@@ -103,7 +89,6 @@ class CombatEngine(PhaseHandlersMixin):
         ctx: GameContext,
         *,
         max_recovery_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
-        max_steps: int = DEFAULT_MAX_STEPS,
         on_sl: Callable[[], None] | None = None,
     ) -> None:
         self._ctx = ctx
@@ -112,7 +97,6 @@ class CombatEngine(PhaseHandlersMixin):
 
         # 熔断护栏 (可在构造时覆盖)
         self._max_recovery_attempts = max_recovery_attempts
-        self._max_steps = max_steps
 
         # SL 恢复动作 (由 ops 层注入, 见类文档 on_sl 说明)
         self._on_sl = on_sl
@@ -219,23 +203,18 @@ class CombatEngine(PhaseHandlersMixin):
         result = CombatResult(history=self._history)
 
         while True:
-            # ── 护栏 2：步数上限 ──
-            # 封住「识别始终成功但页面不再推进」的死循环（含节点追踪失败
-            # 反复撤退）。正常一次节点战斗 8~14 步，此处默认 200 步余量充足。
+            # ``_steps`` 仅作计数供日志/诊断用, **不再作为退出条件**。
+            #
+            # 步数上限已于 2026-10-13 移除（用户判断: 战舰少女的战斗长度
+            # 由节点数决定，没有固定步数语义，用步数封顶没有意义）。
+            # 它原本想兜的两类场景实际都兜不住或已被覆盖：
+            #   - 「节点追踪失败反复撤退」：它每场清零，而该类循环每场只走
+            #     约 5 步 → 永远攒不到上限（2026-10-13 实测确认）。现由
+            #     ``NormalFightTrigger._track_idle_loop`` 在跨场层面兜。
+            #   - 「单场内识别成功但页面不推进」：由各状态的独立超时
+            #     （FIGHT_PERIOD 30s / RESULT 90s / NIGHT_PROMPT 150s）+
+            #     恢复次数上限 ``max_recovery_attempts`` 覆盖。
             self._steps += 1
-            if self._steps > self._max_steps:
-                _log.error(
-                    '[Combat] 步数超限 ({} > {}), 判定状态机卡死。'
-                    '当前 phase={} node={} 节点数={} 历史={} —— 判 SL 重开整局',
-                    self._steps,
-                    self._max_steps,
-                    self._phase.name,
-                    self._node,
-                    self._node_count,
-                    self._history,
-                )
-                result.flag = ConditionFlag.SL
-                break
 
             try:
                 decision = self._step()

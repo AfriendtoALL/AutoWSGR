@@ -40,7 +40,7 @@ import struct
 import time
 from typing import TYPE_CHECKING
 
-from autowsgr.infra import EmulatorConfig, EmulatorConnectionError, RepeatedActionError
+from autowsgr.infra import EmulatorConfig, EmulatorConnectionError
 from autowsgr.infra.config import operation_delay
 from autowsgr.infra.logger import caller_info, get_logger
 
@@ -55,25 +55,6 @@ if TYPE_CHECKING:
     from adbutils import AdbDevice
 
 _log = get_logger('emulator')
-
-# ── 重复动作检测 (2026-10-12, 卡死诊断) ──
-#: 同一坐标连续点击超过该秒数即判定界面无进展(秒)。
-#:
-#: 为什么不用「速率」判据（2026-10-12 修正）：实测正常的状态识别轮询
-#: 最高可达 **66 次/10 秒**（遍及 2026-10-09/10/11 十余个日志），
-#: 「10 秒 20 次」这种速率阈值会**必然误报**正常战斗。轮询本来就该高频，
-#: 真正说明无进展的是「点了这么久还没匹配上」，故改用**持续时长**。
-#:
-#: 180 的依据（2026-10-13 用户实机反馈后上调，原 60s 误报）：
-#: 正常战斗中有些合法轮询会超过 60s —— `NIGHT_PROMPT` 状态超时上限 150s、
-#: `RESULT` 90s，其等待期内的重复点击都可能逼近原阈值。60s 会把
-#: 「正常的慢」判成故障。
-#:
-#: ⚠️ **余量提示**：实测真实故障为 185.4s（2026-10-11，123 次/同坐标），
-#: 阈值 180s 只比它低5.4s。**这个阈值几乎贴着已知故障样本**，
-#: 意味着比185s 更短的同类故障将检测不到。若后续发现漏报，
-#: 应上调而非下调；或改用「进度感知」判据（见下方 docstring）。
-REPEAT_STUCK_SECONDS = 180.0
 
 # ── scrcpy 2.7 控制流协议常量 ──
 # 参考：scrcpy app/src/control_msg.h / control_msg.c (v2.7)
@@ -142,9 +123,6 @@ class ScrcpyController(AndroidController):
         self._native_resolution: tuple[int, int] = (0, 0)
         self._stream: ScrcpyVideoStream | None = None
 
-        # 重复动作检测 (2026-10-12): 键=归一化坐标, 值=连续点击的起始时刻
-        self._repeat_since: dict[tuple[float, float], float] = {}
-        self._last_click_caller = '<unknown>'
 
         # 加速通道 (connect() 中初始化; 未连接前为 None)
         self._nemu: 'NemuIpcCapture | None' = None
@@ -481,8 +459,6 @@ class ScrcpyController(AndroidController):
 
     # 引入一个开关，当参数为：click(x, y, delay=False) 时关闭延迟，该方法默认打开全局延迟，全局延迟可以在 config.py 内设置
     def click(self, x: float, y: float, *, delay: bool = True) -> None:
-        self._last_click_caller = caller_info()
-        self._note_action(x, y)
         w, h = self._resolution
         px, py = self._to_absolute(x, y)
         _log.debug(
@@ -499,43 +475,6 @@ class ScrcpyController(AndroidController):
 
         if delay:  # True 才走延迟
             time.sleep(operation_delay())
-
-    def _note_action(self, x: float, y: float) -> None:
-        """记录一次点击, 若同坐标持续重复且**无任何进展**则抛异常。
-
-        为什么需要它
-        ------------
-        7x24 挂机有一种故障逃过了所有超时与熔断：**界面无进展但脚本仍在
-        按节奏重复点同一处**。实测（2026-10-11 用户手动关 MuMu，日志
-        ``logs/2026-10-11_08-28-24``）该坐标被点了 **123 次 / 持续 185 秒**，
-        而同一日志里其它坐标均只出现 1 次。
-
-        ⚠️ 判据是**持续时长**而非速率（2026-10-12 修正）
-        --------------------------------------------
-        初版用「10 秒内超过 20 次」判定，实测日志证明**必然误报**：
-        正常的状态识别轮询（``recognizer.wait_for_phase`` 在等待动画时
-        每 100~180ms 点一次加速）最高能到**66 次/10 秒**，样本遍及
-        2026-10-09/10/11 十多个日志文件。速率阈值无法区分二者
-        —— 因为轮询本来就该高频，「点了多少次」不是无进展的证据，
-        **「点了这么久还没匹配上」才是**。
-
-        故改为：同坐标连续点击持续超过 :data:`REPEAT_STUCK_SECONDS`
-        即判定无进展。185 秒的真实故障 vs 30 秒的状态超时有充分余量。
-        """
-        now = time.monotonic()
-        key = (round(x, 3), round(y, 3))
-        first = self._repeat_since.get(key)
-        if first is None:
-            self._repeat_since[key] = now
-            return
-
-        span = now - first
-        if span > REPEAT_STUCK_SECONDS:
-            raise RepeatedActionError(
-                f'同一坐标 ({x:.3f}, {y:.3f}) 已连续点击 {span:.1f}s '
-                f'(阈值 {REPEAT_STUCK_SECONDS:g}s) 仍未匹配到新状态，'
-                f'判定界面无进展 —— 上次调用: {self._last_click_caller}'
-            )
 
     def swipe(
         self,
