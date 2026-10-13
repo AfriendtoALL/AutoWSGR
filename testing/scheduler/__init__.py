@@ -1,1 +1,1 @@
-"""timed_scheduler 测试包初始化。"""
+"""scheduler 层测试包。"""
