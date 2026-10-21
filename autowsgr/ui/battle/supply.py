@@ -17,11 +17,16 @@
   点击「全部补给」按钮 (即 ``CLICK_SUPPLY_ALL``)。原逐舰船点击的补给规则已
   废弃，统一改为点击右侧「全部补给」。
 
-⚠️ **两种模式都会每轮校正复选框状态** (2026-10-12 修复)：复选框是游戏内的
+⚠️ **脚本模式每轮校正复选框状态** (2026-10-12 修复)：复选框是游戏内的
 持久状态，不随页面切换重置。此前 ``'script'`` 模式从不碰它，导致上一轮
 ``'auto'`` 模式留下的勾选态持续生效 —— 脚本补完弹药后，出击时游戏再自动补
 一次，既白耗燃料，又让「按需补给」的语义彻底失效。详见
 :meth:`SupplyMixin.disable_auto_supply`。
+
+``'auto'`` 模式则在首次校正成功后把结果缓存到
+:attr:`~autowsgr.context.game_context.GameContext.supply_state`，同一会话
+后续战斗直接跳过识别 (2026-10-21 优化)：复选框不会自行改变，游戏会在出击
+时自动补给，脚本无需每场重复截图确认。
 """
 
 from __future__ import annotations
@@ -29,12 +34,12 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
+from autowsgr.context.supply import SupplyState
 from autowsgr.infra.logger import get_logger
 from autowsgr.ui.battle.base import BaseBattlePreparation, Panel
 from autowsgr.ui.battle.constants import (
-    CLICK_SHIP_SLOT,
-    CLICK_SUPPORT,
     CLICK_SUPPLY_ALL,
+    CLICK_SUPPORT,
     SUPPORT_DISABLE,
     SUPPORT_ENABLE,
     SUPPORT_EXHAUSTED,
@@ -178,24 +183,38 @@ class SupplyMixin(BaseBattlePreparation):
                 time.sleep(0.6)
         return None
 
-    def apply_supply(self, *, mode: str | None = None) -> None:
+    def _supply_state(self) -> SupplyState:
+        """获取补给会话缓存；兼容未挂载该字段的测试替身。"""
+        state = getattr(self._ctx, 'supply_state', None)
+        if not isinstance(state, SupplyState):
+            state = SupplyState()
+            try:
+                self._ctx.supply_state = state
+            except AttributeError:
+                pass
+        return state
+
+    def apply_supply(self, *, mode: str | None = None, force: bool = False) -> None:
         """按需补给——**任一舰船弹药全空**即补给 (2026-10-10 用户指令)。
 
-        先把游戏内「自动补给」复选框调整到与 :paramref:`mode` 一致的状态,
-        再按需补给:
-
         - ``'auto'``   : 勾选游戏内自动补给复选框 (见 :meth:`ensure_auto_supply`),
-                        由游戏在出击时自动补给。
+                        由游戏在出击时自动补给。首次校正成功后在本会话内缓存,
+                        后续战斗不再重复识别。
         - ``'script'`` : **先取消**自动补给勾选 (见 :meth:`disable_auto_supply`),
-                        再按需点击「全部补给」。
+                        再按需点击「全部补给」。每场都会重新校正复选框, 防止
+                        上一模式或用户手动操作留下的勾选态。
 
-        为什么取消勾选必须在**判断是否需要补给之前**
-        -------------------------------------------
+        为什么脚本模式必须在**判断是否需要补给之前**校正复选框
+        ------------------------------------------------------
         复选框是**游戏内的持久状态**, 不随页面切换重置。若不在每轮显式校正,
         上一轮 ``'auto'`` 模式留下的勾选态会持续生效 —— 此时脚本补完弹药,
         出击时游戏再自动补一次, 「按需补给」的语义彻底失效 (2026-10-12 用户指出)。
 
-        弹药检测 (:meth:`has_empty_ammo_ship`) 的三种结果:
+        ``'auto'`` 模式下弹药检测没有意义: 游戏会在出击时自动补给, 脚本无须
+        关心当前弹药状态。因此本方法在确保复选框后立即返回, 不再调用
+        :meth:`has_empty_ammo_ship` (2026-10-21 优化)。
+
+        脚本模式的弹药检测 (:meth:`has_empty_ammo_ship`) 三种结果:
 
         - 存在全空船 → 执行补给 (全部补给会一并补满其他船);
         - 所有船尚有弹药 → 跳过补给并记 INFO 日志;
@@ -209,20 +228,32 @@ class SupplyMixin(BaseBattlePreparation):
             显式指定补给方式，可选 ``'auto'`` / ``'script'``。缺省时读取配置
             :attr:`~autowsgr.infra.config.UserConfig.supply_mode`
             (默认 ``'script'``)。
+        force:
+            忽略会话缓存，强制重新识别并校正复选框。仅影响 ``'auto'`` 模式;
+            ``'script'`` 模式本来就每场校正。
         """
         cfg = getattr(self._ctx, 'config', None)
         resolved = mode or getattr(cfg, 'supply_mode', None) or SUPPLY_MODE_SCRIPT
-        if resolved != SUPPLY_MODE_AUTO and resolved != SUPPLY_MODE_SCRIPT:
+        if resolved not in (SUPPLY_MODE_AUTO, SUPPLY_MODE_SCRIPT):
             _log.warning('[UI] 未知补给方式 {!r}, 回退为脚本补给', resolved)
             resolved = SUPPLY_MODE_SCRIPT
 
-        # ── 先校正复选框状态 (幂等, 与弹药检测无关) ──
-        # 顺序很关键: 复选框是持久状态, 必须每轮校正, 否则残留的勾选态
-        # 会在出击时触发游戏的自动补给, 抵消脚本的按需补给。
+        state = self._supply_state()
+
+        # ── auto: 游戏在出击时自动补给, 脚本只需保证复选框一次 ──
         if resolved == SUPPLY_MODE_AUTO:
-            self.ensure_auto_supply()
-        else:
-            self.disable_auto_supply()
+            if force or not state.checkbox_correct_for(resolved):
+                state.invalidate()  # 校正失败时下次仍会重试
+                self.ensure_auto_supply()
+                state.mark_checkbox_correct(resolved)
+            else:
+                _log.debug('[UI] 自动补给复选框已确认, 跳过识别')
+            return
+
+        # ── script: 保持每场校正, 防止上一模式/手动操作留下勾选态 ──
+        state.invalidate()
+        self.disable_auto_supply()
+        state.mark_checkbox_correct(resolved)
 
         ammo_state = self.has_empty_ammo_ship()
         if ammo_state is False:
@@ -230,8 +261,5 @@ class SupplyMixin(BaseBattlePreparation):
             return
         if ammo_state is None:
             _log.warning('[UI] 弹药状态未知 (未见子弹行), 跳过补给')
-            return
-        if resolved == SUPPLY_MODE_AUTO:
-            # 游戏会在出击时自动补给, 脚本不介入。
             return
         self.supply_all()

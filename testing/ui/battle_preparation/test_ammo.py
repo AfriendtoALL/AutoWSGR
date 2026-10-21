@@ -7,7 +7,7 @@
   全部判"状态未知" → 旧兜底直接补给 (弹药 40% 也误补)。
 - 2026-10-10: 整行占比算法对检测段边界敏感 (低弹药时唯一填充格 =
   最左红色警告格, 贴近旧段左缘被切在框外) → 误判全空 → 误补给。
-  现为**单点检测** (第 1 格中心 3×3, 差分校准坐标), 从机制上消除
+  现为**单点检测** (第 1 格中心 3x3, 差分校准坐标), 从机制上消除
   边界敏感问题。
 """
 
@@ -22,6 +22,7 @@ from autowsgr.context import GameContext
 from autowsgr.emulator import AndroidController
 from autowsgr.infra.config import UserConfig
 from autowsgr.ui.battle.ammo import detect_ammo_empty
+from autowsgr.ui.battle.base import Panel
 from autowsgr.ui.battle.constants import (
     AMMO_BAR_Y1,
     AMMO_BAR_Y2,
@@ -30,7 +31,6 @@ from autowsgr.ui.battle.constants import (
 )
 from autowsgr.ui.battle.preparation import BattlePreparationPage
 from autowsgr.ui.battle.supply import SUPPLY_MODE_AUTO, SUPPLY_MODE_SCRIPT
-from autowsgr.ui.battle.base import Panel
 
 
 # 屏幕基准尺寸 (与截图一致, 缩放无关因为坐标相对)。
@@ -40,9 +40,9 @@ _W, _H = 960, 540
 # 填充子弹实测见过黄/蓝/绿/红(警告)四种色相, 判定是色相无关的 (饱和度策略)。
 yellow_rgb = (234, 173, 31)
 gray_rgb = (139, 140, 140)
-blue_rgb = (14, 140, 229)     # 部分舰船的填充子弹色
-green_rgb = (64, 161, 109)    # 部分填充见过的绿色子弹
-red_rgb = (230, 60, 60)       # 低弹药警告色 (最左格)
+blue_rgb = (14, 140, 229)  # 部分舰船的填充子弹色
+green_rgb = (64, 161, 109)  # 部分填充见过的绿色子弹
+red_rgb = (230, 60, 60)  # 低弹药警告色 (最左格)
 
 
 def _make_screen() -> np.ndarray:
@@ -53,19 +53,19 @@ def _make_screen() -> np.ndarray:
 
 
 def _paint_point(screen: np.ndarray, slot: int, rgb: tuple[int, int, int]) -> None:
-    """在 slot 的检测点 (第 1 格中心) 涂 3×3 邻域色。"""
+    """在 slot 的检测点 (第 1 格中心) 涂 3x3 邻域色。"""
     rx, ry = AMMO_FIRST_CELL_POINTS[slot]
     cx, cy = int(rx * _W), int(ry * _H)
-    screen[cy - 1:cy + 2, cx - 1:cx + 2] = rgb
+    screen[cy - 1 : cy + 2, cx - 1 : cx + 2] = rgb
 
 
 def _paint_row_gray_around_point(screen: np.ndarray, slot: int) -> None:
     """检测点两侧涂灰 (模拟该船仅剩第 1 格有弹的行环境, 增强真实感)。"""
-    rx, ry = AMMO_FIRST_CELL_POINTS[slot]
-    cx, cy = int(rx * _W), int(ry * _H)
+    rx, _ = AMMO_FIRST_CELL_POINTS[slot]
+    cx = int(rx * _W)
     y1, y2 = int(AMMO_BAR_Y1 * _H), int(AMMO_BAR_Y2 * _H)
-    screen[y1:y2, max(0, cx - 30):cx - 2] = gray_rgb
-    screen[y1:y2, cx + 2:cx + 30] = gray_rgb
+    screen[y1:y2, max(0, cx - 30) : cx - 2] = gray_rgb
+    screen[y1:y2, cx + 2 : cx + 30] = gray_rgb
 
 
 def test_full_ammo_not_empty():
@@ -90,20 +90,20 @@ def test_empty_ammo_detected():
     screen = _make_screen()
     _paint_point(screen, 1, gray_rgb)
     res = detect_ammo_empty(screen)
-    assert res[1] is True   # 第 1 格灰 = 弹药全空
-    assert res[0] is None   # 无舰船 (深色背景)
+    assert res[1] is True  # 第 1 格灰 = 弹药全空
+    assert res[0] is None  # 无舰船 (深色背景)
 
 
 def test_low_ammo_red_cell_regression():
     """实机回归 (2026-10-10 误补给): 弹药仅剩最左 1 格红色警告格。
 
     旧整行占比算法对检测段边界敏感 (红格贴近段左缘), 曾误判全空 →
-    误触发补给。单点检测 (第 1 格中心 3×3) 必须判 False (有弹)。
+    误触发补给。单点检测 (第 1 格中心 3x3) 必须判 False (有弹)。
     """
     screen = _make_screen()
     for slot in range(6):
-        _paint_point(screen, slot, red_rgb)          # 红色警告格
-        _paint_row_gray_around_point(screen, slot)   # 两侧灰格环境
+        _paint_point(screen, slot, red_rgb)  # 红色警告格
+        _paint_row_gray_around_point(screen, slot)  # 两侧灰格环境
     res = detect_ammo_empty(screen)
     assert res == [False] * 6
 
@@ -136,7 +136,7 @@ def test_occupied_override_marks_unoccupied_as_none():
 
 def test_occupied_override_reports_for_occupied_only():
     screen = _make_screen()
-    _paint_point(screen, 0, gray_rgb)    # 空弹药
+    _paint_point(screen, 0, gray_rgb)  # 空弹药
     _paint_point(screen, 1, yellow_rgb)  # 有弹药
     res = detect_ammo_empty(screen, occupied=[True, True, False, False, False, False])
     assert res[0] is True
@@ -153,7 +153,7 @@ def _make_page(screen: np.ndarray) -> BattlePreparationPage:
 def test_detect_fleet_snapshot_includes_ammo_empty():
     screen = _make_screen()
     _paint_point(screen, 0, yellow_rgb)  # 有弹药
-    _paint_point(screen, 1, gray_rgb)    # 空弹药
+    _paint_point(screen, 1, gray_rgb)  # 空弹药
     page = _make_page(screen)
     with patch.object(
         page,
@@ -181,7 +181,7 @@ def test_public_detect_ammo_empty_method():
 # ─────────────────────────────────────────────
 
 
-def _make_page_cfg(ctrl, cfg: UserConfig) -> BattlePreparationPage:
+def _make_page_cfg(ctrl: AndroidController, cfg: UserConfig) -> BattlePreparationPage:
     return BattlePreparationPage(GameContext(ctrl=ctrl, config=cfg, ocr=None, ship_ocr=None))
 
 
@@ -321,6 +321,54 @@ def test_apply_supply_auto_mode_never_disables_checkbox():
         disable.assert_not_called()
 
 
+def test_apply_supply_auto_mode_skips_ammo_detection():
+    """auto 模式由游戏在出击时补给，脚本不需要检测弹药状态。"""
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig(supply_mode=SUPPLY_MODE_AUTO))
+    with (
+        patch.object(page, 'ensure_auto_supply'),
+        patch.object(page, 'has_empty_ammo_ship') as ammo,
+    ):
+        page.apply_supply()
+        ammo.assert_not_called()
+
+
+def test_apply_supply_auto_mode_caches_checkbox_check():
+    """复选框是持久状态：同一会话只需在首场确认一次。"""
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig(supply_mode=SUPPLY_MODE_AUTO))
+    with patch.object(page, 'ensure_auto_supply') as ensure:
+        page.apply_supply()
+        page.apply_supply()
+        ensure.assert_called_once()
+
+
+def test_apply_supply_auto_mode_force_rechecks():
+    """force=True 必须绕过缓存重新确认复选框。"""
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig(supply_mode=SUPPLY_MODE_AUTO))
+    with patch.object(page, 'ensure_auto_supply') as ensure:
+        page.apply_supply()
+        page.apply_supply(force=True)
+        assert ensure.call_count == 2
+
+
+def test_apply_supply_auto_after_script_rechecks_checkbox():
+    """模式切换会改变复选框状态，切回 auto 时必须重新确认。"""
+    ctrl = MagicMock(spec=AndroidController)
+    page = _make_page_cfg(ctrl, UserConfig(supply_mode=SUPPLY_MODE_AUTO))
+    with (
+        patch.object(page, 'ensure_auto_supply') as ensure,
+        patch.object(page, 'disable_auto_supply') as disable,
+        patch.object(page, 'has_empty_ammo_ship', return_value=False),
+    ):
+        page.apply_supply()  # auto → 首次确认
+        page.apply_supply(mode=SUPPLY_MODE_SCRIPT)  # script → 取消勾选
+        page.apply_supply(mode=SUPPLY_MODE_AUTO)  # 缓存失效 → 重新确认
+        assert ensure.call_count == 2
+        disable.assert_called_once()
+
+
 def test_apply_supply_script_disables_checkbox_even_when_no_supply_needed():
     """**顺序关键**：即使弹药充足不补给，也必须校正复选框。
 
@@ -429,7 +477,7 @@ def test_apply_supply_supplies_when_any_ship_empty():
     """
     screen = _make_screen()
     _paint_point(screen, 0, yellow_rgb)  # 1 号位尚有弹药
-    _paint_point(screen, 1, gray_rgb)    # 2 号位弹药全空
+    _paint_point(screen, 1, gray_rgb)  # 2 号位弹药全空
     ctrl = MagicMock(spec=AndroidController)
     ctrl.screenshot.return_value = screen
     page = _make_page_cfg(ctrl, UserConfig(supply_mode=SUPPLY_MODE_SCRIPT))

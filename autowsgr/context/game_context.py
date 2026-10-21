@@ -17,6 +17,7 @@ from .expedition import ExpeditionQueue
 from .fleet import Fleet
 from .resources import Resources
 from .ship import Ship
+from .supply import SupplyState
 
 
 if TYPE_CHECKING:
@@ -41,7 +42,7 @@ def _default_fleets() -> list[Fleet]:
     return [Fleet(fleet_id=i) for i in range(1, _NUM_FLEETS + 1)]
 
 
-def _default_drop_counts_interactor(ctx: GameContext) -> 'LootShipCount':
+def _default_drop_counts_interactor(ctx: GameContext) -> LootShipCount:
     """读取每日掉落计数的默认实现 (含全部 UI 交互)。
 
     **ui / ops 的依赖集中在这里, 且只在函数内导入** —— ``context`` 层
@@ -146,9 +147,7 @@ class GameContext:
     daily_overlay_date: date | None = None
     """最近一次完成主页面浮层处理的日期 (时间戳 gate: 每日 0 点后首次处理, 跨日失效)。"""
 
-    overlay_ready_maps: set[tuple[str | None, str, str | None]] = field(
-        default_factory=set
-    )
+    overlay_ready_maps: set[tuple[str | None, str, str | None]] = field(default_factory=set)
     """"上一场成功打完、战后回港弹层可直接复用再出击"的关卡身份集合。
 
     键 = ``(活动代号, 地图代码, 入口)``, 详见
@@ -167,13 +166,22 @@ class GameContext:
     也随之消失。
     """
 
+    supply_state: SupplyState = field(default_factory=SupplyState)
+    """补给复选框的会话级缓存。
+
+    **为什么放在 ctx 而非 runner 实例** (2026-10-21): 触发器模式每轮经
+    ``plan.factory(ctx)`` 新建 runner，实例属性每轮归零；而复选框是游戏内
+    持久状态，同一 ctx 生命周期内只需在 ``'auto'`` 模式首次出征时校正一次。
+    详见 :class:`autowsgr.context.supply.SupplyState`。
+    """
+
     active_fight_tasks: int = 0
     """当前正在执行的战斗任务数。由 TaskScheduler 维护，用于判断是否可以安全执行浴室维修等会占用舰队的操作。"""
 
     stop_event: threading.Event = field(default_factory=threading.Event)
     """任务停止信号 (由 TaskManager 设置)。"""
 
-    drop_counts_interactor: Callable[['GameContext'], object] | None = None
+    drop_counts_interactor: Callable[[GameContext], object] | None = None
     """读取每日掉落计数的交互实现 (返回含 ``ship``/``loot`` 的对象)。
 
     ``None`` 时用 :func:`_default_drop_counts_interactor`。注入点用于测试 ——

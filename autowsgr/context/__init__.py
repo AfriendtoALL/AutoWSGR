@@ -7,6 +7,7 @@ from .fleet import Fleet
 from .game_context import GameContext
 from .resources import Resources
 from .ship import Ship
+from .supply import SupplyState
 
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     'GameContext',
     'Resources',
     'Ship',
+    'SupplyState',
 ]
