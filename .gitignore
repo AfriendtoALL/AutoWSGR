@@ -140,3 +140,15 @@ test_*.ipynb
 *_test.ipynb
 .jupyter/
 .jupyter_ystore.db
+usersettings.yaml
+*.yaml.bak
+# Windows 系统生成文件
+Thumbs.db
+Desktop.ini
+
+# macOS 系统生成文件 (虽然你用的是 Win/WSL，但开源项目通常加上)
+.DS_Store
+
+# 本地数据库或缓存
+*.sqlite3
+*.db
