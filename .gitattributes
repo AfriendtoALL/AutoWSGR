@@ -1,0 +1,8 @@
+# Force LF for all text files.
+* text=auto eol=lf
+
+# Binary files — do not touch.
+*.png binary
+*.PNG binary
+*.jpg binary
+*.onnx binary

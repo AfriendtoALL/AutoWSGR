@@ -1,0 +1,121 @@
+"""好友页面 UI 控制器。
+
+已完成
+
+页面入口:
+    主页面 → 侧边栏 → 好友
+
+
+使用方式::
+
+    from autowsgr.ui.friend_page import FriendPage
+
+    page = FriendPage(ctrl)
+    page.go_back()
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from autowsgr.infra.logger import get_logger
+from autowsgr.types import PageName
+from autowsgr.ui.utils import click_and_wait_for_page
+from autowsgr.vision import (
+    MatchStrategy,
+    PageMatch,
+    PixelRule,
+    PixelSignature,
+)
+
+
+if TYPE_CHECKING:
+    import numpy as np
+
+    from autowsgr.context import GameContext
+
+
+_log = get_logger('ui')
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 页面识别签名
+# ═══════════════════════════════════════════════════════════════════════════════
+
+PAGE_SIGNATURE = PixelSignature(
+    name='好友页',
+    strategy=MatchStrategy.ALL,
+    rules=[
+        PixelRule.of(0.1953, 0.0444, (255, 255, 255), tolerance=30.0),
+        PixelRule.of(0.1641, 0.0574, (255, 252, 243), tolerance=30.0),
+        PixelRule.of(0.2094, 0.0574, (14, 131, 226), tolerance=30.0),
+        PixelRule.of(0.1521, 0.0361, (15, 132, 228), tolerance=30.0),
+        PixelRule.of(0.1724, 0.0389, (32, 128, 205), tolerance=30.0),
+        PixelRule.of(0.1651, 0.0370, (240, 255, 255), tolerance=30.0),
+    ],
+)
+"""好友页面像素签名。"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 点击坐标
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CLICK_BACK: tuple[float, float] = (0.022, 0.058)
+"""回退按钮 (◁)，返回侧边栏。"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 页面控制器
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class FriendPage:
+    """好友页面控制器。
+
+    Parameters
+    ----------
+    ctrl:
+        Android 设备控制器实例。
+    """
+
+    def __init__(self, ctx: GameContext) -> None:
+        self._ctx = ctx
+        self._ctrl = ctx.ctrl
+
+    # ── 页面识别 ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def is_current_page(screen: np.ndarray) -> PageMatch:
+        """判断截图是否为好友页面。
+
+        通过标签页统一检测层判定 (4 标签 + 头部探测点较亮),返回带覆盖度分数的 PageMatch。
+
+        Parameters
+        ----------
+        screen:
+            截图 (HxWx3, RGB)。
+        """
+        from autowsgr.ui.tabbed_page import TabbedPageType, check_tabbed_page
+
+        return check_tabbed_page(screen, TabbedPageType.FRIEND)
+
+    # ── 回退 ──────────────────────────────────────────────────────────────
+
+    def go_back(self) -> None:
+        """点击回退按钮 (◁)，返回侧边栏。
+
+        Raises
+        ------
+        NavigationError
+            超时仍在好友页面。
+        """
+        from autowsgr.ui.sidebar_page import SidebarPage
+
+        _log.info('[UI] 好友 → 返回侧边栏')
+        click_and_wait_for_page(
+            self._ctrl,
+            click_coord=CLICK_BACK,
+            checker=SidebarPage.is_current_page,
+            source='好友',
+            target=PageName.SIDEBAR,
+        )

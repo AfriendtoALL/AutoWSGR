@@ -1,0 +1,435 @@
+"""基于像素特征的图像识别引擎。
+
+``PixelChecker`` 对截图执行像素签名匹配，判定当前页面/状态。
+
+数据类型见 :mod:`autowsgr.vision.pixel`:
+  - :class:`Color` / :class:`PixelRule` / :class:`PixelSignature`
+  - :class:`MatchStrategy` / :class:`PixelDetail` / :class:`PixelMatchResult`
+
+使用方式::
+
+    from autowsgr.vision import Color, PixelRule, PixelSignature, PixelChecker
+
+    main_page = PixelSignature(
+        name="main_page",
+        rules=[
+            PixelRule(0.50, 0.85, Color.of(54, 129, 201)),
+            PixelRule(0.20, 0.60, Color.of(226, 253, 47)),
+        ],
+    )
+    result = PixelChecker.check_signature(screen, main_page)
+    if result:
+        print("当前在主页")
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import cv2
+import numpy as np
+
+from autowsgr.infra.logger import get_logger
+
+# 从 pixel.py 导入所有数据类型 (保持向后兼容)
+from .pixel import (
+    Color,
+    CompositePixelSignature,
+    MatchStrategy,
+    PixelDetail,
+    PixelMatchResult,
+    PixelRule,
+    PixelSignature,
+)
+
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+
+_log = get_logger('vision.pixel')
+
+
+class PixelChecker:
+    """像素特征检测引擎 — 视觉层核心 API。
+
+    所有方法接收 numpy 数组形式的截图 (HxWx3, RGB uint8)，
+    坐标一律使用相对值（左上角为 0.0，右下角趋近 1.0），
+    内部自动转换为像素索引，与截图分辨率无关。
+    """
+
+    # ── 单像素 ──
+
+    @staticmethod
+    def get_pixel(screen: np.ndarray, x: float, y: float) -> Color:
+        """获取截图中指定坐标的像素颜色。
+
+        Parameters
+        ----------
+        screen:
+            截图 (HxWx3, RGB)。
+        x, y:
+            像素的相对坐标（左上角为 0.0，右下角趋近 1.0）。
+        """
+        h, w = screen.shape[:2]
+        px, py = int(x * w), int(y * h)
+        rgb = screen[py, px]
+        return Color(r=int(rgb[0]), g=int(rgb[1]), b=int(rgb[2]))
+
+    @staticmethod
+    def check_pixel(
+        screen: np.ndarray,
+        x: float,
+        y: float,
+        color: Color,
+        tolerance: float = 30.0,
+    ) -> bool:
+        """检查单个像素是否与期望颜色匹配。"""
+        actual = PixelChecker.get_pixel(screen, x, y)
+        return actual.near(color, tolerance)
+
+    # ── 多像素批量 ──
+
+    @staticmethod
+    def get_pixels(
+        screen: np.ndarray,
+        positions: Sequence[tuple[float, float]],
+    ) -> list[Color]:
+        """批量获取多个坐标的像素颜色。"""
+        return [PixelChecker.get_pixel(screen, x, y) for x, y in positions]
+
+    @staticmethod
+    def check_pixels(
+        screen: np.ndarray,
+        rules: Sequence[PixelRule],
+    ) -> list[bool]:
+        """批量检查多条像素规则。"""
+        return [PixelChecker.check_pixel(screen, r.x, r.y, r.color, r.tolerance) for r in rules]
+
+    # ── 签名匹配 ──
+
+    @staticmethod
+    def check_signature(
+        screen: np.ndarray,
+        signature: PixelSignature | CompositePixelSignature,
+        *,
+        with_details: bool = False,
+    ) -> PixelMatchResult:
+        """检查截图是否匹配一个像素签名。
+
+        支持单签名 (:class:`PixelSignature`) 和组合签名
+        (:class:`CompositePixelSignature`)。组合签名按 OR 逻辑
+        依次检查子签名，首个匹配即短路返回。
+
+        Parameters
+        ----------
+        screen:
+            截图 (HxWx3, RGB)。
+        signature:
+            要检查的像素签名（单个或组合）。
+        with_details:
+            是否在结果中包含每条规则的详情（影响性能，调试用）。
+        """
+        if isinstance(signature, CompositePixelSignature):
+            return PixelChecker._check_composite(
+                screen,
+                signature,
+                with_details=with_details,
+            )
+
+        details: list[PixelDetail] = []
+        matched_count = 0
+
+        for rule in signature.rules:
+            actual = PixelChecker.get_pixel(screen, rule.x, rule.y)
+            dist = actual.distance(rule.color)
+            is_match = dist <= rule.tolerance
+
+            if is_match:
+                matched_count += 1
+
+            if with_details:
+                details.append(
+                    PixelDetail(rule=rule, actual=actual, distance=dist, matched=is_match)
+                )
+
+            _log.trace(
+                "[Matcher] '{}' [{:.4f},{:.4f}] 期望{} 实际{} 距离={:.1f} {}",
+                signature.name,
+                rule.x,
+                rule.y,
+                rule.color.as_rgb_tuple(),
+                actual.as_rgb_tuple(),
+                dist,
+                'OK' if is_match else f'FAIL(容差={rule.tolerance})',
+            )
+
+            # 短路优化
+            if signature.strategy == MatchStrategy.ALL and not is_match:
+                if not with_details:
+                    _log.trace(
+                        "[Matcher] '{}' FAIL 短路退出 - ALL 首次失败于 [{:.4f},{:.4f}]",
+                        signature.name,
+                        rule.x,
+                        rule.y,
+                    )
+                    return PixelMatchResult(
+                        matched=False,
+                        signature_name=signature.name,
+                        matched_count=matched_count,
+                        total_count=len(signature),
+                    )
+            elif signature.strategy == MatchStrategy.ANY and is_match and not with_details:
+                _log.trace(
+                    "[Matcher] '{}' OK 短路退出 - ANY 首次成功于 [{:.4f},{:.4f}]",
+                    signature.name,
+                    rule.x,
+                    rule.y,
+                )
+                return PixelMatchResult(
+                    matched=True,
+                    signature_name=signature.name,
+                    matched_count=matched_count,
+                    total_count=len(signature),
+                )
+
+        # 根据策略判定最终结果
+        total = len(signature)
+        match signature.strategy:
+            case MatchStrategy.ALL:
+                matched = matched_count == total
+            case MatchStrategy.ANY:
+                matched = matched_count > 0
+            case MatchStrategy.COUNT:
+                matched = matched_count >= signature.threshold
+
+        _log.debug(
+            "[Matcher] '{}' {} ({}/{} 规则匹配, 策略={})",
+            signature.name,
+            'OK' if matched else 'FAIL',
+            matched_count,
+            total,
+            signature.strategy.value,
+        )
+        return PixelMatchResult(
+            matched=matched,
+            signature_name=signature.name,
+            matched_count=matched_count,
+            total_count=total,
+            details=tuple(details) if with_details else (),
+        )
+
+    @staticmethod
+    def _check_composite(
+        screen: np.ndarray,
+        composite: CompositePixelSignature,
+        *,
+        with_details: bool = False,
+    ) -> PixelMatchResult:
+        """检查组合签名（OR 逻辑）。"""
+        total_rules = len(composite)
+        all_details: list[PixelDetail] = []
+        total_matched = 0
+
+        for sig in composite.signatures:
+            result = PixelChecker.check_signature(
+                screen,
+                sig,
+                with_details=with_details,
+            )
+            total_matched += result.matched_count
+            if with_details:
+                all_details.extend(result.details)
+            if result.matched:
+                _log.debug(
+                    "[Matcher] composite '{}' OK — 子签名 '{}' 匹配",
+                    composite.name,
+                    sig.name,
+                )
+                return PixelMatchResult(
+                    matched=True,
+                    signature_name=composite.name,
+                    matched_count=total_matched,
+                    total_count=total_rules,
+                    details=tuple(all_details),
+                )
+
+        _log.debug(
+            "[Matcher] composite '{}' FAIL — 所有子签名 ({}) 均未匹配",
+            composite.name,
+            len(composite.signatures),
+        )
+        return PixelMatchResult(
+            matched=False,
+            signature_name=composite.name,
+            matched_count=total_matched,
+            total_count=total_rules,
+            details=tuple(all_details),
+        )
+
+    @staticmethod
+    def identify(
+        screen: np.ndarray,
+        signatures: Sequence[PixelSignature],
+        *,
+        with_details: bool = False,
+    ) -> PixelMatchResult | None:
+        """从多个签名中识别当前页面/状态（首次匹配）。"""
+        for sig in signatures:
+            result = PixelChecker.check_signature(screen, sig, with_details=with_details)
+            if result:
+                _log.debug("[Matcher] identify() → '{}'", result.signature_name)
+                return result
+        _log.debug('[Matcher] identify() → None（共 {} 个签名均未匹配）', len(signatures))
+        return None
+
+    @staticmethod
+    def identify_all(
+        screen: np.ndarray,
+        signatures: Sequence[PixelSignature],
+        *,
+        with_details: bool = False,
+    ) -> list[PixelMatchResult]:
+        """检查所有签名，返回所有匹配的结果。"""
+        results: list[PixelMatchResult] = []
+        for sig in signatures:
+            result = PixelChecker.check_signature(screen, sig, with_details=with_details)
+            if result:
+                results.append(result)
+        _log.debug(
+            '[Matcher] identify_all() → {} / {} 匹配: [{}]',
+            len(results),
+            len(signatures),
+            ', '.join(r.signature_name for r in results),
+        )
+        return results
+
+    # ── 颜色分类 ──
+
+    @staticmethod
+    def classify_color(
+        screen: np.ndarray,
+        x: float,
+        y: float,
+        color_map: dict[str, Color],
+        tolerance: float = 30.0,
+    ) -> str | None:
+        """将像素颜色分类到最近的命名颜色。
+
+        Parameters
+        ----------
+        screen:
+            截图。
+        x, y:
+            像素的相对坐标。
+        color_map:
+            命名颜色映射 ``{"name": Color(...), ...}``。
+        tolerance:
+            最大容差，超过则返回 None。
+        """
+        actual = PixelChecker.get_pixel(screen, x, y)
+        best_name: str | None = None
+        best_dist = tolerance + 1.0
+        for name, color in color_map.items():
+            dist = actual.distance(color)
+            if dist < best_dist:
+                best_dist = dist
+                best_name = name
+        result_name = best_name if best_dist <= tolerance else None
+        _log.debug(
+            '[Matcher] classify_color({:.3f},{:.3f}) → {} (dist={:.1f})',
+            x,
+            y,
+            result_name,
+            best_dist if result_name else -1,
+        )
+        return result_name
+
+    # ── 图像裁切 ──
+
+    @staticmethod
+    def crop(
+        screen: np.ndarray,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+    ) -> np.ndarray:
+        """裁切矩形区域（相对坐标）。"""
+        h, w = screen.shape[:2]
+        px1, py1 = int(x1 * w), int(y1 * h)
+        px2, py2 = int(x2 * w), int(y2 * h)
+        return screen[py1:py2, px1:px2].copy()
+
+    @staticmethod
+    def crop_rotated(
+        screen: np.ndarray,
+        bl_x: float,
+        bl_y: float,
+        tr_x: float,
+        tr_y: float,
+        angle: float,
+    ) -> np.ndarray:
+        """裁切旋转矩形区域（相对坐标）。
+
+        适用于截图中文字倾斜排列的场景（如舰船掉落页的舰名/舰种）。
+        给定对角线两端点（左下、右上）和旋转角度，计算旋转矩形并裁切。
+
+        Parameters
+        ----------
+        screen:
+            截图 (HxWx3, RGB)。
+        bl_x, bl_y:
+            左下角相对坐标。
+        tr_x, tr_y:
+            右上角相对坐标。
+        angle:
+            顺时针旋转角度（度），正值表示文字向右上方倾斜。
+        """
+        h, w = screen.shape[:2]
+        x1, y2 = int(bl_x * w), int(bl_y * h)
+        x2, y1 = int(tr_x * w), int(tr_y * h)
+
+        # 对角线长度及方向
+        diag = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+        diag_orientation = np.arctan2(y2 - y1, x2 - x1)
+        diag_angle = diag_orientation - np.radians(angle)
+        rect_w = int(diag * np.cos(diag_angle))
+        rect_h = int(diag * np.sin(diag_angle))
+
+        center = ((x1 + x2) // 2, (y1 + y2) // 2)
+        rot_angle = 360 - angle
+
+        # 计算旋转矩形的轴对齐包围盒
+        cos_a = abs(np.cos(np.radians(rot_angle)))
+        sin_a = abs(np.sin(np.radians(rot_angle)))
+        bbx_w = int(rect_w * cos_a + rect_h * sin_a)
+        bbx_h = int(rect_w * sin_a + rect_h * cos_a)
+
+        # 裁切包围盒
+        bbx_x1 = max(center[0] - bbx_w // 2, 0)
+        bbx_y1 = max(center[1] - bbx_h // 2, 0)
+        bbx_x2 = min(center[0] + bbx_w // 2, w)
+        bbx_y2 = min(center[1] + bbx_h // 2, h)
+        bbx_crop = screen[bbx_y1:bbx_y2, bbx_x1:bbx_x2]
+
+        # 在裁切后的图像上旋转
+        crop_h, crop_w = bbx_crop.shape[:2]
+        crop_center = (crop_w / 2, crop_h / 2)
+        rot_mat = cv2.getRotationMatrix2D(crop_center, rot_angle, 1.0)
+
+        bound_w = int(crop_h * abs(rot_mat[0, 1]) + crop_w * abs(rot_mat[0, 0]))
+        bound_h = int(crop_h * abs(rot_mat[0, 0]) + crop_w * abs(rot_mat[0, 1]))
+        rot_mat[0, 2] += bound_w / 2 - crop_center[0]
+        rot_mat[1, 2] += bound_h / 2 - crop_center[1]
+
+        rotated = cv2.warpAffine(bbx_crop, rot_mat, (bound_w, bound_h))
+
+        # 从旋转后的图像中心裁切目标矩形
+        rc = (rotated.shape[1] // 2, rotated.shape[0] // 2)
+        half_w, half_h = rect_w // 2, rect_h // 2
+        result = rotated[
+            max(rc[1] - half_h, 0) : rc[1] + (rect_h - half_h),
+            max(rc[0] - half_w, 0) : rc[0] + (rect_w - half_w),
+        ]
+        return result.copy()

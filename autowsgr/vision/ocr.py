@@ -1,0 +1,833 @@
+"""OCR 引擎抽象层。
+
+提供统一的文字识别接口，支持 EasyOCR 和 MaaFramework FastOCR 后端。
+
+使用方式::
+
+    from autowsgr.vision import OCREngine
+
+    engine = OCREngine.create("easyocr", gpu=False, mirror="tencent")
+    results = engine.recognize(cropped_image)
+    number = engine.recognize_number(resource_area)
+"""
+
+from __future__ import annotations
+
+import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar
+
+import cv2
+import easyocr
+from easyocr.recognition import get_text as easyocr_get_text
+
+from autowsgr.constants import SHIPNAMES, normalize_ship_name
+from autowsgr.infra.logger import get_logger
+from autowsgr.vision.ocr_rules import (
+    EasyOCRProfile,
+    FastOCRProfile,
+    apply_ship_name_rules,
+    expand_ship_name_candidates,
+    get_easyocr_params,
+    get_fastocr_params,
+)
+
+
+if TYPE_CHECKING:
+    import numpy as np
+
+
+_log = get_logger('vision.ocr')
+
+
+_ship_name_match_confidence: float = 0.0
+_MIN_CUSTOM_NAME_BASE_LENGTH = 2
+_MIN_TRUNCATED_OCR_LENGTH = 4
+_MIN_FRAGMENT_OCR_LENGTH = 4
+
+
+def set_ship_name_match_confidence(threshold: float) -> None:
+    """设置船池匹配置信度；0 为关闭，其他值限制在 0 到 1。"""
+    global _ship_name_match_confidence  # noqa: PLW0603
+    _ship_name_match_confidence = max(0.0, min(1.0, threshold))
+
+
+# ── 结果数据类 ──
+
+# ── 舰船名文本补丁管线 ──
+
+
+def apply_ship_patches(text: str) -> str:
+    """应用集中登记的舰名 OCR 特殊规则。"""
+    return apply_ship_name_rules(text)
+
+
+@dataclass(frozen=True, slots=True)
+class OCRResult:
+    """OCR 识别结果。
+
+    Attributes
+    ----------
+    text:
+        识别出的文本。
+    confidence:
+        置信度 (0.0-1.0)。
+    bbox:
+        文本区域边界框 (x1, y1, x2, y2)，可能为 None。
+    """
+
+    text: str
+    confidence: float
+    bbox: tuple[int, int, int, int] | None = None
+
+
+# ── 自定义异常 ──
+
+
+class ShipNameMismatchError(ValueError):
+    """当 OCR 识别到文本但编辑距离超过最大阈值时抛出。
+
+    Attributes
+    ----------
+    text:
+        OCR 识别出的原始文本。
+    best_candidate:
+        编辑距离最近的候选舰船名。
+    distance:
+        与 best_candidate 的 Levenshtein 距离。
+    max_threshold:
+        触发异常的最大编辑距离阈值。
+    """
+
+    def __init__(
+        self,
+        text: str,
+        best_candidate: str,
+        distance: int,
+        max_threshold: int,
+    ) -> None:
+        self.text = text
+        self.best_candidate = best_candidate
+        self.distance = distance
+        self.max_threshold = max_threshold
+        super().__init__(
+            f"OCR 识别到 '{text}'，与最近候选 '{best_candidate}' 编辑距离={distance} "
+            f'超过最大阈值 {max_threshold}，拒绝匹配'
+        )
+
+
+# ── 抽象基类 ──
+
+
+class OCREngine(ABC):
+    """OCR 引擎抽象基类。
+
+    子类只需实现 :meth:`recognize` 方法。
+    高层便捷方法 (recognize_single, recognize_number, recognize_ship_name)
+    基于 recognize 构建，无需子类重写。
+
+    Parameters
+    ----------
+    verbose:
+        是否在 DEBUG 级别打印每次识别的细节日志。
+        为 False 时改用 TRACE 级别，减少日志噪音。
+    """
+
+    verbose: bool = True
+    """控制 OCR 详情日志级别 (True → DEBUG, False → TRACE)。"""
+
+    @abstractmethod
+    def recognize(
+        self,
+        image: np.ndarray,
+        allowlist: str = '',
+    ) -> list[OCRResult]:
+        """识别图像中的文字。
+
+        Parameters
+        ----------
+        image:
+            输入图像 (RGB, uint8)。
+        allowlist:
+            仅允许识别的字符集（空字符串表示不限制）。
+
+        Returns
+        -------
+        list[OCRResult]
+            识别结果列表，按位置排列。
+        """
+        ...
+
+    def recognize_line(
+        self,
+        image: np.ndarray,
+        allowlist: str = '',
+        *,
+        easyocr_profile: EasyOCRProfile | str = EasyOCRProfile.DEFAULT,
+    ) -> list[OCRResult]:
+        """识别已裁好的单行文字。
+
+        EasyOCR 使用配置档案中的完整参数，其他引擎使用其中的字符白名单。
+        """
+        params = get_easyocr_params(easyocr_profile)
+        return self.recognize(image, allowlist or params.allowlist)
+
+    def recognize_batch(
+        self,
+        images: list[np.ndarray],
+        allowlist: str = '',
+    ) -> list[list[OCRResult]]:
+        """Recognize equal-purpose image regions as one logical batch."""
+        return [self.recognize(image, allowlist) for image in images]
+
+    # ── 便捷方法 ──
+
+    def recognize_single(
+        self,
+        image: np.ndarray,
+        allowlist: str = '',
+    ) -> OCRResult:
+        """识别单个文本区域，返回置信度最高的结果。
+
+        无结果时返回空文本、零置信度的 OCRResult。
+        """
+        results = self.recognize(image, allowlist)
+        _log_fn = _log.debug if self.verbose else _log.trace
+        if not results:
+            _log_fn('[OCR] recognize_single: 无结果')
+            return OCRResult(text='', confidence=0.0)
+        best = max(results, key=lambda r: r.confidence)
+        _log_fn("[OCR] recognize_single: '{}' (conf={:.2f})", best.text, best.confidence)
+        return best
+
+    def recognize_maxlen(
+        self,
+        image: np.ndarray,
+        allowlist: str = '',
+    ) -> OCRResult:
+        """识别单个文本区域，返回置信度最高的结果。
+
+        无结果时返回空文本、零置信度的 OCRResult。
+        """
+        results = self.recognize(image, allowlist)
+        _log_fn = _log.debug if self.verbose else _log.trace
+        if not results:
+            _log_fn('[OCR] recognize_maxlen: 无结果')
+            return OCRResult(text='', confidence=0.0)
+        best = max(results, key=lambda r: len(r.text))
+        _log_fn("[OCR] recognize_maxlen: '{}' (conf={:.2f})", best.text, best.confidence)
+        return best
+
+    def recognize_number(
+        self,
+        image: np.ndarray,
+        extra_chars: str = '',
+    ) -> int | None:
+        """识别数字，支持 K/M 后缀。
+        不依赖位置信息
+        Parameters
+        ----------
+        image:
+            包含数字的图像区域。
+        extra_chars:
+            除数字外允许的额外字符。
+
+        Returns
+        -------
+        int | None
+            识别出的数字，无法解析时返回 None。
+        """
+        result = self.recognize_single(image, allowlist='0123456789' + extra_chars)
+        text = result.text.strip()
+        if not text:
+            return None
+
+        # 处理 K / M 后缀
+        multiplier = 1
+        if text.upper().endswith('K'):
+            multiplier = 1000
+            text = text[:-1]
+        elif text.upper().endswith('M'):
+            multiplier = 1_000_000
+            text = text[:-1]
+
+        _log_fn = _log.debug if self.verbose else _log.trace
+        try:
+            value = int(float(text) * multiplier)
+            _log_fn("[OCR] recognize_number: '{}' → {}", result.text.strip(), value)
+        except (ValueError, TypeError):
+            _log_fn("[OCR] recognize_number: '{}' 解析失败", result.text.strip())
+            return None
+        else:
+            return value
+
+    def recognize_ship_name(
+        self,
+        image: np.ndarray,
+        candidates: list[str] | None = None,
+        threshold: int = 3,
+    ) -> str | None:
+        """识别舰船名称，模糊匹配到候选列表。
+        不依赖位置信息
+        Parameters
+        ----------
+        image:
+            舰船名称区域图像。
+        candidates:
+            候选舰船名列表。为 ``None`` 时使用全局 :data:`SHIPNAMES`。
+        threshold:
+            编辑距离阈值，超过则不匹配。
+
+        Returns
+        -------
+        str | None
+            匹配到的舰船名，或 None。
+        """
+        if candidates is None:
+            candidates = SHIPNAMES
+        result = self.recognize_single(image)
+        _log_fn = _log.debug if self.verbose else _log.trace
+        if not result.text:
+            _log_fn('[OCR] recognize_ship_name: 无文本')
+            return None
+        raw_text = result.text
+        corrected = apply_ship_patches(raw_text)
+        if corrected != raw_text:
+            _log_fn(
+                "[OCR] recognize_ship_name: raw='{}' -> patched='{}'",
+                raw_text,
+                corrected,
+            )
+        else:
+            _log_fn("[OCR] recognize_ship_name: raw='{}'", raw_text)
+        matched = _fuzzy_match(corrected, candidates, threshold)
+        _log_fn(
+            "[OCR] recognize_ship_name: '{}' -> '{}'",
+            raw_text,
+            matched or '未匹配',
+        )
+        return matched
+
+    def recognize_ship_names(
+        self,
+        image: np.ndarray,
+        candidates: list[str] | None = None,
+        threshold: int = 3,
+        max_threshold: int | None = None,
+    ) -> list[str]:
+        """识别图像中的多个舰船名，对每个文本区域做模糊匹配与自动校正。
+        不依赖位置信息
+        与 :meth:`recognize_ship_name` 的区别：本方法调用 :meth:`recognize` 获取
+        图像中所有文本区域，再逐一与候选列表做模糊匹配，适合一张图中包
+        含多个舰船名的场景。
+
+        Parameters
+        ----------
+        image:
+            包含舰船名的图像。
+        candidates:
+            候选舰船名列表。为 ``None`` 时使用全局 :data:`SHIPNAMES`。
+        threshold:
+            编辑距离软阈值：distance ≤ threshold 时接受自动校正后的名称。
+        max_threshold:
+            最大编辑距离硬阈值：若某段识别文本与所有候选的最小编辑距离
+            超过此值，则抛出 :exc:`ShipNameMismatchError`。
+            为 ``None`` 时禁用此检查，超阈值的文本仅被静默跳过。
+
+        Returns
+        -------
+        list[str]
+            识别并自动校正后的舰船名列表，按图像中的出现顺序，已去重。
+
+        Raises
+        ------
+        ShipNameMismatchError
+            当某段识别文本与所有候选的编辑距离均超过 max_threshold 时。
+        """
+        if candidates is None:
+            candidates = SHIPNAMES
+        results = self.recognize(image)
+        _log_fn = _log.debug if self.verbose else _log.trace
+        seen: set[str] = set()
+        matched: list[str] = []
+        for r in results:
+            text = r.text.strip()
+            if not text:
+                continue
+            raw_text = text
+            text = apply_ship_patches(text)
+            if text != raw_text:
+                _log_fn(
+                    "[OCR] recognize_ship_names: raw='{}' -> patched='{}'",
+                    raw_text,
+                    text,
+                )
+            best = _fuzzy_match(text, candidates, threshold)
+            if best is not None:
+                _log_fn(
+                    "[OCR] recognize_ship_names: '{}' -> '{}'",
+                    raw_text,
+                    best,
+                )
+                if best not in seen:
+                    seen.add(best)
+                    matched.append(best)
+            else:
+                if max_threshold is not None and candidates:
+                    best_candidate = min(candidates, key=lambda c: _edit_distance(text, c))
+                    dist = _edit_distance(text, best_candidate)
+                    if dist > max_threshold:
+                        raise ShipNameMismatchError(text, best_candidate, dist, max_threshold)
+                _log_fn("[OCR] recognize_ship_names: '{}' 无匹配 (阈值={})，跳过", text, threshold)
+        _log_fn('[OCR] recognize_ship_names: 共识别 {} 艘: {}', len(matched), matched)
+        return matched
+
+    # ── 工厂方法 ──
+
+    _instances: ClassVar[dict[str, OCREngine]] = {}
+    """已创建的引擎单例缓存，key 为 ``"<engine>:<gpu>"``。"""
+
+    @classmethod
+    def create(
+        cls, engine: str = 'easyocr', gpu: bool = False, mirror: str = 'tencent'
+    ) -> OCREngine:
+        """创建或获取 OCR 引擎实例（单例）。
+
+        首次调用时创建引擎实例并缓存，后续相同参数的调用直接返回缓存实例。
+
+        Parameters
+        ----------
+        engine:
+            引擎名称: ``"easyocr"`` 或 ``"fastocr"``。
+        gpu:
+            是否使用 GPU 加速。
+        mirror:
+            EasyOCR 模型下载镜像源: ``"origin"`` / ``"github"`` / ``"tencent"`` / ``"modelscope"``。
+
+        Returns
+        -------
+        OCREngine
+        """
+        cache_key = f'{engine}:{gpu}'
+        if cache_key in cls._instances:
+            _log.debug('[OCR] 复用已有 {} 实例（gpu={}）', engine, gpu)
+            return cls._instances[cache_key]
+
+        if engine == 'easyocr':
+            _log.info('[OCR] 初始化 EasyOCR 引擎（gpu={}, mirror={}）', gpu, mirror)
+            instance = EasyOCREngine(gpu=gpu, mirror=mirror)
+            cls._instances[cache_key] = instance
+            return instance
+        if engine == 'fastocr':
+            _log.info('[OCR] 初始化 FastOCR 引擎 (PP-OCRv6-small, CPU)')
+            instance = FastOCREngine()
+            cls._instances[cache_key] = instance
+            return instance
+        raise ValueError(f'不支持的 OCR 引擎: {engine}，可选: easyocr, fastocr')
+
+
+# ── 具体实现 ──
+
+
+class EasyOCREngine(OCREngine):
+    """基于 EasyOCR 的识别引擎。"""
+
+    def __init__(self, gpu: bool = False, mirror: str = 'tencent') -> None:
+        from autowsgr.vision.easyocr_models_checker import ensure_models
+
+        ensure_models(mirror)
+        self._reader = easyocr.Reader(
+            ['ch_sim', 'en'],
+            gpu=gpu,
+            quantize=False,
+        )
+
+    @staticmethod
+    def _convert_results(raw_results: list) -> list[OCRResult]:
+        return [
+            OCRResult(
+                text=str(text),
+                confidence=float(confidence),
+                bbox=(
+                    int(box[0][0]),
+                    int(box[0][1]),
+                    int(box[2][0]),
+                    int(box[2][1]),
+                ),
+            )
+            for box, text, confidence in raw_results
+        ]
+
+    def recognize(
+        self,
+        image: np.ndarray,
+        allowlist: str = '',
+    ) -> list[OCRResult]:
+        kwargs: dict = {}
+        if allowlist:
+            kwargs['allowlist'] = allowlist
+        raw = self._reader.readtext(image, **kwargs)
+        return self._convert_results(raw)
+
+    def recognize_line(
+        self,
+        image: np.ndarray,
+        allowlist: str = '',
+        *,
+        easyocr_profile: EasyOCRProfile | str = EasyOCRProfile.DEFAULT,
+    ) -> list[OCRResult]:
+        """根据调用场景配置档案识别已裁剪单行文字。"""
+        params = get_easyocr_params(easyocr_profile)
+        effective_allowlist = allowlist or params.allowlist
+        kwargs: dict = {
+            'decoder': params.decoder,
+            'detail': 1,
+            'contrast_ths': params.contrast_ths,
+            'adjust_contrast': params.adjust_contrast,
+        }
+        if effective_allowlist:
+            kwargs['allowlist'] = effective_allowlist
+        raw = self._reader.recognize(image, **kwargs)
+        return self._convert_results(raw)
+
+    def recognize_batch(
+        self,
+        images: list[np.ndarray],
+        allowlist: str = '',
+    ) -> list[list[OCRResult]]:
+        if not images:
+            return []
+        ignore_char = (
+            ''.join(set(self._reader.character) - set(allowlist))
+            if allowlist
+            else ''.join(set(self._reader.character) - set(self._reader.lang_char))
+        )
+        width = max(image.shape[1] for image in images)
+        image_list = []
+        for image in images:
+            height, image_width = image.shape[:2]
+            box = ((0, 0), (image_width, 0), (image_width, height), (0, height))
+            grey = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            image_list.append((box, grey))
+        raw = easyocr_get_text(
+            self._reader.character,
+            64,
+            width,
+            self._reader.recognizer,
+            self._reader.converter,
+            image_list,
+            ignore_char,
+            batch_size=1,
+            contrast_ths=0,
+            workers=0,
+            device=self._reader.device,
+        )
+        if len(raw) != len(images):
+            raise RuntimeError('EasyOCR recognizer batch result count mismatch')
+        return [
+            [OCRResult(text=text, confidence=float(conf), bbox=None)] for _box, text, conf in raw
+        ]
+
+
+class FastOCREngine(OCREngine):
+    """基于 MaaFramework FastOCR 和 PP-OCRv6-small 的 CPU 引擎。"""
+
+    _MODEL_DIR_ENV = 'AUTOWSGR_FASTOCR_MODEL_DIR'
+    _USER_DIR_ENV = 'AUTOWSGR_FASTOCR_USER_DIR'
+    _THRESHOLD_ENV = 'AUTOWSGR_FASTOCR_THRESHOLD'
+    _BUNDLED_MODEL_DIR = Path(__file__).resolve().parents[1] / 'data' / 'ocr' / 'ppocr_v6_small'
+
+    def __init__(self) -> None:
+        from maa.library import Library
+        from maa.pipeline import JOCR, JRecognitionType
+        from maa.resource import Resource
+        from maa.tasker import Tasker
+        from maa.toolkit import Toolkit
+
+        configured_model_dir = os.getenv(self._MODEL_DIR_ENV, '').strip()
+        model_dir = (
+            Path(configured_model_dir).expanduser().resolve()
+            if configured_model_dir
+            else self._BUNDLED_MODEL_DIR
+        )
+        required_files = ('det.onnx', 'rec.onnx', 'keys.txt')
+        missing = [name for name in required_files if not (model_dir / name).is_file()]
+        if missing:
+            raise RuntimeError(f'FastOCR 模型目录缺少文件: {", ".join(missing)}')
+
+        configured_user_dir = os.getenv(self._USER_DIR_ENV, '').strip()
+        user_dir = (
+            Path(configured_user_dir).expanduser().resolve()
+            if configured_user_dir
+            else Path.home() / '.autowsgr' / 'fastocr'
+        )
+        user_dir.mkdir(parents=True, exist_ok=True)
+        if not Toolkit.init_option(user_dir, {'logging': False}):
+            raise RuntimeError('FastOCR 初始化 MaaFramework Toolkit 失败')
+
+        resource = Resource()
+        if not resource.use_cpu():
+            raise RuntimeError('FastOCR 无法启用 CPU 执行器')
+        model_job = resource.post_ocr_model(model_dir).wait()
+        if not model_job.succeeded:
+            raise RuntimeError(f'FastOCR 无法加载模型: {model_dir}')
+
+        tasker = Tasker()
+        tasker._resource_holder = resource
+        bound = Library.framework().MaaTaskerBindResource(
+            tasker._handle,
+            resource._handle,
+        )
+        if not bound or not tasker.inited:
+            raise RuntimeError('FastOCR 无法绑定 OCR Resource')
+
+        try:
+            self._threshold = float(os.getenv(self._THRESHOLD_ENV, '0.3'))
+        except ValueError as exc:
+            raise RuntimeError(f'{self._THRESHOLD_ENV} 必须是数字') from exc
+        self._tasker = tasker
+        self._resource = resource
+        self._recognition_type = JRecognitionType.OCR
+        self._ocr_options_type = JOCR
+
+    def recognize(
+        self,
+        image: np.ndarray,
+        allowlist: str = '',
+    ) -> list[OCRResult]:
+        """执行完整文字检测，之后按调用方提供的字符集过滤文本。"""
+        return self._recognize(image, allowlist, FastOCRProfile.DEFAULT)
+
+    def recognize_line(
+        self,
+        image: np.ndarray,
+        allowlist: str = '',
+        *,
+        easyocr_profile: EasyOCRProfile | str = EasyOCRProfile.DEFAULT,
+    ) -> list[OCRResult]:
+        """跳过文字检测，识别已裁剪的单行文字。"""
+        easyocr_params = get_easyocr_params(easyocr_profile)
+        return self._recognize(
+            image,
+            allowlist or easyocr_params.allowlist,
+            FastOCRProfile.SINGLE_LINE,
+        )
+
+    def _recognize(
+        self,
+        image: np.ndarray,
+        allowlist: str,
+        profile: FastOCRProfile,
+    ) -> list[OCRResult]:
+        """根据集中维护的 FastOCR 参数执行识别。"""
+        params = get_fastocr_params(profile)
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        job = self._tasker.post_recognition(
+            self._recognition_type,
+            self._ocr_options_type(
+                only_rec=params.only_rec,
+                threshold=self._threshold,
+            ),
+            bgr,
+        ).wait()
+        if not job.succeeded:
+            raise RuntimeError('FastOCR 识别任务失败')
+        detail = job.get()
+        if detail is None:
+            raise RuntimeError('FastOCR 未返回识别详情')
+
+        results: list[OCRResult] = []
+        for node in detail.nodes:
+            recognition = node.recognition
+            if recognition is None:
+                continue
+            for result in recognition.filtered_results:
+                text = str(getattr(result, 'text', ''))
+                if allowlist:
+                    text = ''.join(character for character in text if character in allowlist)
+                if not text:
+                    continue
+                box_x, box_y, box_width, box_height = map(float, result.box)
+                results.append(
+                    OCRResult(
+                        text=text,
+                        confidence=float(result.score),
+                        bbox=(
+                            round(box_x),
+                            round(box_y),
+                            round(box_x + box_width),
+                            round(box_y + box_height),
+                        ),
+                    )
+                )
+        return sorted(
+            results,
+            key=lambda result: (
+                result.bbox[1] if result.bbox is not None else 0,
+                result.bbox[0] if result.bbox is not None else 0,
+            ),
+        )
+
+
+# ── 辅助函数 ──
+
+
+def _fuzzy_match(text: str, candidates: list[str], threshold: int = 3) -> str | None:
+    """按明确关系和唯一编辑距离匹配舰名，不在歧义时猜测。"""
+    unique_candidates = list(dict.fromkeys(expand_ship_name_candidates(candidates)))
+    if not text or not unique_candidates:
+        return None
+
+    if _ship_name_match_confidence > 0.0:
+        pool_name, handled = _fuzzy_match_pool_aware(
+            text,
+            unique_candidates,
+            _ship_name_match_confidence,
+        )
+        if handled:
+            return normalize_ship_name(pool_name)
+
+    # 单字只接受精确匹配，二至三字最多允许一个字符识别错误。
+    effective_threshold = (
+        0 if len(text) == 1 else min(threshold, 1) if len(text) <= 3 else threshold
+    )
+    distances = [(name, _edit_distance(text, name)) for name in unique_candidates]
+    best_dist = min(distance for _, distance in distances)
+    nearest = list(
+        dict.fromkeys(
+            normalize_ship_name(name) for name, distance in distances if distance == best_dist
+        ),
+    )
+    best_name = nearest[0] if len(nearest) == 1 and best_dist <= effective_threshold else None
+
+    if best_name is not None:
+        _log.debug(
+            "[OCR] fuzzy_match: '{}' -> '{}' (distance={})",
+            text,
+            best_name,
+            best_dist,
+        )
+        return best_name
+
+    if len(nearest) != 1:
+        _log.debug("[OCR] fuzzy_match: '{}' -> 最近候选并列: {}", text, nearest)
+        return None
+
+    _log.debug(
+        "[OCR] fuzzy_match: '{}' -> 无匹配 (best='{}', distance={}, threshold={})",
+        text,
+        nearest[0],
+        best_dist,
+        effective_threshold,
+    )
+    return None
+
+
+def _fuzzy_match_pool_aware(  # noqa: PLR0911
+    text: str,
+    candidates: list[str],
+    confidence_threshold: float,
+) -> tuple[str | None, bool]:
+    """处理精确名称、明确自定义后缀和唯一长舰名片段。"""
+    exact = [name for name in candidates if name == text]
+    if exact:
+        name = normalize_ship_name(exact[0])
+        _log.debug("[OCR] pool_match: '{}' -> '{}' (exact)", text, name)
+        return name, True
+
+    # 单字基础名不能通过自定义后缀扩展，避免把长 OCR 文本强制映射到单字舰名。
+    if any(len(name) == 1 and text.startswith(f'{name}·') for name in candidates):
+        return None, True
+
+    custom_suffix_matches = [
+        name
+        for name in candidates
+        if len(name) >= _MIN_CUSTOM_NAME_BASE_LENGTH and text.startswith(f'{name}·')
+    ]
+    truncated_matches = [
+        name
+        for name in candidates
+        if len(text) >= _MIN_TRUNCATED_OCR_LENGTH and name.startswith(text)
+    ]
+    fragment_matches = [
+        name
+        for name in candidates
+        if len(text) >= _MIN_FRAGMENT_OCR_LENGTH and text in name and not name.startswith(text)
+    ]
+
+    relation_count = sum(
+        bool(matches) for matches in (custom_suffix_matches, truncated_matches, fragment_matches)
+    )
+    if relation_count > 1:
+        related_names = {
+            normalize_ship_name(name)
+            for matches in (custom_suffix_matches, truncated_matches, fragment_matches)
+            for name in matches
+        }
+        if len(related_names) != 1:
+            _log.warning("[OCR] pool_match: '{}' 同时符合多种舰名关系，拒绝猜测", text)
+            return None, True
+
+    if custom_suffix_matches:
+        longest = max(map(len, custom_suffix_matches))
+        matches = [name for name in custom_suffix_matches if len(name) == longest]
+        match_type = 'custom suffix'
+        matched_length = len(matches[0]) if len(matches) == 1 else 0
+        compared_text_length = len(text) - 1
+    elif truncated_matches:
+        matches = truncated_matches
+        match_type = 'truncated OCR'
+        matched_length = len(text)
+        compared_text_length = len(text)
+    elif fragment_matches:
+        matches = fragment_matches
+        match_type = 'unique OCR fragment'
+        matched_length = len(text)
+        compared_text_length = len(text)
+    else:
+        return None, False
+
+    standard_names = list(dict.fromkeys(normalize_ship_name(name) for name in matches))
+    if len(standard_names) != 1:
+        if standard_names:
+            _log.warning("[OCR] pool_match: '{}' 前缀候选不唯一: {}", text, standard_names)
+        return None, True
+
+    matched_candidate = matches[0]
+    name = standard_names[0]
+    # 唯一的四字符以上原文片段已经包含完整文字证据，不按目标总长度降权。
+    confidence = (
+        1.0
+        if match_type == 'unique OCR fragment'
+        else 2 * matched_length / (compared_text_length + len(matched_candidate))
+    )
+    if confidence < confidence_threshold:
+        return None, True
+    _log.debug(
+        "[OCR] pool_match: '{}' -> '{}' ({}, confidence={:.3f}, threshold={:.3f})",
+        text,
+        name,
+        match_type,
+        confidence,
+        confidence_threshold,
+    )
+    return name, True
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein 编辑距离。"""
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            dp[j] = min(
+                dp[j] + 1,
+                dp[j - 1] + 1,
+                prev + (0 if a[i - 1] == b[j - 1] else 1),
+            )
+            prev = temp
+    return dp[n]

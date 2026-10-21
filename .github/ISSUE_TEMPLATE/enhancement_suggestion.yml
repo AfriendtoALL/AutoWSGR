@@ -1,0 +1,35 @@
+---
+name: 💪 改进建议
+description: 分享你认为 AutoWSGR 可以改进的地方
+type: Feature
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你抽出时间分享你的观点！我们很想听听你认为 AutoWSGR 如何能更好地满足你的需求
+  - type: checkboxes
+    id: checkboxes
+    attributes:
+      label: Validations
+      description: 在提交您的改进建议之前
+      options:
+        - label: 我已经阅读了 [用户文档](https://docs-autowsgr.notion.site/) 并尝试自己解决问题，同时在社群中进行了讨论
+          required: false
+        - label: 我无法找到任何 [open issue](https://github.com/OpenWSGR/AutoWSGR/issues?q=is%3Aopen+is%3Aissue) 提出了相同的建议
+          required: false
+  - type: textarea
+    attributes:
+      label: 问题描述
+      description: 请描述你希望通过这个建议的改进解决的问题。如果适用，请附上截图、GIF 或视频，以更好地传达你的想法
+      placeholder: |
+        Short description
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: 解决方案
+      description: 请描述你希望如何解决这个问题。如果适用，请附上截图、GIF 或视频，以更好地传达你的想法。
+      placeholder: |
+        Short description
+    validations:
+      required: false

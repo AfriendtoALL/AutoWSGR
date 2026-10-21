@@ -1,0 +1,25 @@
+# AutoWSGR v2 — 简化配置示例
+# ==========================================
+# 仅需填写与默认值不同的项; 未列出的项全部使用内置默认值。
+# 完整可选项请参考 usersettings.full.yaml
+#
+# 配置查找顺序:
+#   1. launch("path/to/config.yaml")  — 显式指定
+#   2. 当前工作目录下的 usersettings.yaml  — 自动检测
+#   3. 无配置文件时使用内置默认值
+
+# ── 模拟器 ──
+emulator:
+  type: 雷电                     # 雷电 / 蓝叠 / MuMu / 夜神 / 逍遥 / WAYDROID
+  # serial: "127.0.0.1:5555"    # 多开时手动指定, 默认自动检测
+
+# ── 账号 ──
+account:
+  game_app: 官服                 # 官服 / 小米服 / 应用宝服
+
+# ── 日常自动化 ──
+daily_automation:
+  auto_battle: true
+  battle_type: 困难潜艇
+  auto_exercise: true
+  exercise_fleet_id: 2

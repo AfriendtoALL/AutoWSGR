@@ -1,0 +1,50 @@
+"""战斗系统 — 独立于 UI 框架的战斗状态机引擎。"""
+
+from .engine import CombatEngine, run_combat
+from .fleet import (
+    ALLOWED_SHIP_TYPE_CODES,
+    FleetPreset,
+    FleetSelectionSource,
+    FleetSlotRule,
+    ResolvedFleetSelection,
+    ShipSelector,
+    fleet_slot_from_api,
+    resolve_fleet_selection,
+)
+from .history import CombatEvent, CombatHistory, CombatResult, FightResult, grade_condition_met
+from .node_tracker import MapNodeData, NodeTracker
+from .plan import CombatMode, CombatPlan, GradeCondition, NodeDecision
+from .recognition import (
+    recognize_enemy_formation,
+)
+from .rules import RuleEngine, RuleResult
+from .state import CombatPhase
+
+
+__all__ = [
+    'ALLOWED_SHIP_TYPE_CODES',
+    'CombatEngine',
+    'CombatEvent',
+    'CombatHistory',
+    'CombatMode',
+    'CombatPhase',
+    'CombatPlan',
+    'CombatResult',
+    'FightResult',
+    'FleetPreset',
+    'FleetSelectionSource',
+    'FleetSlotRule',
+    'GradeCondition',
+    'MapNodeData',
+    'NodeDecision',
+    'NodeTracker',
+    'ResolvedFleetSelection',
+    'RuleEngine',
+    'RuleResult',
+    'ShipSelector',
+    'fleet_slot_from_api',
+    'grade_condition_met',
+    'recognize_enemy_formation',
+    'resolve_fleet_selection',
+    'run_combat',
+]

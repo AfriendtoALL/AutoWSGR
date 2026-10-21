@@ -1,0 +1,4 @@
+- confirm_1
+- confirm_2
+- confirm_3
+- confirm_4：决战确认通关

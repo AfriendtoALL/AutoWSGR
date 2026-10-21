@@ -1,0 +1,33 @@
+# AutoWSGR v2 — 最小可用配置（按需删改，未列出的项用内置默认值）
+# 配置查找顺序：
+#   1. launch("path/to/config.yaml")  显式指定
+#   2. 当前工作目录下的 usersettings.yaml  自动检测
+#   3. 无配置文件时使用内置默认值
+
+# ── 模拟器 ──
+emulator:
+  type: MuMu                    # 雷电 / 蓝叠 / MuMu / 夜神 / 逍遥 / WAYDROID
+  serial: "127.0.0.1:16416"     # 多开时手动指定 ADB serial，默认自动检测
+
+# ── 账号 ──
+account:
+  game_app: 官服                  # 官服 / 小米服 / 应用宝服
+
+# ── OCR 引擎（首次运行会自动下载模型，可保持默认）──
+ocr:
+  gpu: false
+  mirror: modelscope             # 模型下载镜像：origin / github / tencent / modelscope
+
+# ── 日志 ──
+log:
+  level: DEBUG                    # DEBUG / INFO / WARNING / ERROR
+
+# ── 日常自动化 ──
+daily_automation:
+  auto_battle: true
+  battle_type: 困难潜艇
+  auto_exercise: true
+  exercise_fleet_id: 2
+  auto_expedition: true
+  auto_gain_bonus: true
+  auto_bath_repair: true

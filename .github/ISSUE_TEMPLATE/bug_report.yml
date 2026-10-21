@@ -1,0 +1,56 @@
+---
+name: 🐛 问题反馈
+description: 创建报告以帮助我们修复你遇到的问题
+type: Bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你抽出时间报告这个bug！这将帮助我们更快找到问题的原因，减少不必要的来回沟通
+  - type: checkboxes
+    attributes:
+      label: 在提交您的问题反馈之前
+      options:
+        - label: 我已经阅读了 [用户文档](https://docs-autowsgr.notion.site/) 并尝试自己解决问题，同时在社群中进行了讨论
+          required: false
+        - label: 我无法找到任何 [open issue](https://github.com/OpenWSGR/AutoWSGR/issues?q=is%3Aopen+is%3Aissue) 反馈了相同的问题
+          required: false
+  - type: textarea
+    attributes:
+      label: 相关环境信息
+      description: |
+        尽可能详细的提供发生问题的环境信息
+      placeholder: |
+        - 操作系统:
+        - 模拟器:
+        - AutoWSGR版本:
+        - ...
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: 问题描述
+      description: |
+        请提供清晰准确的问题描述
+      placeholder: |
+        Short description
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: 复现方法
+      description: 重现问题的步骤。如果可能的话，请附上 GIF、截图或视频，以便更好地说明问题
+      placeholder: |
+        1. Go to …
+        2. Click on …
+        3. Scroll down to …
+        4. See error
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log输出
+      description: |
+        如果有的话，请提供发生问题时相关的日志输出
+      render: Shell

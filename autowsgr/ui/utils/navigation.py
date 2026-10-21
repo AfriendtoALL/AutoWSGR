@@ -1,0 +1,387 @@
+"""UI 截图-判断-等待 工具函数。
+
+从 ``autowsgr.ui.page`` 迁移而来，提供:
+
+- **NavigationError** — 导航验证失败异常
+- **NavConfig / DEFAULT_NAV_CONFIG** — 导航操作参数
+- **wait_for_page / wait_leave_page** — 底层截图轮询
+- **click_and_wait_for_page / click_and_wait_leave_page** — 带重试的一步导航
+- **confirm_operation** — 确认弹窗点击
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from autowsgr.infra.logger import get_logger
+from autowsgr.vision import ImageChecker
+from autowsgr.vision.waiting import wait_until_leaving
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    import numpy as np
+
+    from autowsgr.emulator import AndroidController
+
+
+_log = get_logger('ui')
+
+# ---------------------------------------------------------------------------
+# 异常
+# ---------------------------------------------------------------------------
+
+
+class NavigationError(Exception):
+    """页面导航验证失败 - 超时未到达目标页面，或重试耗尽。"""
+
+    def __init__(self, msg: str = '', screen: np.ndarray | None = None) -> None:
+        if screen is not None:
+            from autowsgr.infra.logger import save_image
+
+            save_image(screen, tag='NavError')
+        super().__init__(msg)
+
+
+# ---------------------------------------------------------------------------
+# 导航配置
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class NavConfig:
+    """导航操作参数配置。
+
+    Attributes
+    ----------
+    max_retries:
+        点击重试最大次数 (含首次)。
+    retry_delay:
+        两次点击之间的等待 (秒)。
+    timeout:
+        每轮验证的超时 (秒)。
+    interval:
+        验证循环中两次截图的间隔 (秒)。
+    handle_overlays:
+        是否自动处理游戏浮层 (新闻公告等)。
+    """
+
+    max_retries: int = 2
+    retry_delay: float = 1.0
+    timeout: float = 5.0
+    interval: float = 0.5
+    handle_overlays: bool = True
+
+
+DEFAULT_NAV_CONFIG = NavConfig()
+
+
+# ---------------------------------------------------------------------------
+# 底层验证
+# ---------------------------------------------------------------------------
+
+
+def wait_for_page(
+    ctrl: AndroidController,
+    checker: Callable[[np.ndarray], bool],
+    *,
+    timeout: float = DEFAULT_NAV_CONFIG.timeout,
+    interval: float = DEFAULT_NAV_CONFIG.interval,
+    handle_overlays: bool = True,  # noqa: ARG001
+    source: str = '',
+    target: str = '',
+    candidates: set[str] | None = None,
+) -> np.ndarray:
+    """反复截图，直到 ``checker`` 返回 ``True``。
+
+    内置浮层消除。遇到可消除浮层时立即处理并继续轮询（不计入睡眠延迟）。
+
+    Parameters
+    ----------
+    candidates:
+        当前页识别的候选页面名集合 (来自 UIStack), 收缩轮询日志中
+        全量识别的搜索空间;``None`` 时全量识别。
+
+    Raises
+    ------
+    NavigationError
+        超时仍未匹配。
+    """
+    from autowsgr.ui.page import get_current_page
+
+    deadline = time.monotonic() + timeout
+    attempt = 0
+    _log.debug('[UI] 等待到达: {} -> {} (超时 {:.1f}s)', source or '?', target or '?', timeout)
+
+    while True:
+        attempt += 1
+        screen = ctrl.screenshot()
+
+        if checker(screen):
+            _log.debug(
+                '[UI] 已到达: {} -> {} (第 {} 次截图)', source or '?', target or '?', attempt
+            )
+            return screen
+
+        current = get_current_page(screen, candidates=candidates)
+        _log.debug(
+            '[UI] 等待 #{}: {} -> {}, 当前={}',
+            attempt,
+            source or '?',
+            target or '?',
+            current or '未知',
+        )
+
+        if time.monotonic() >= deadline:
+            msg = (
+                f'等待超时: {source or "?"} -> {target or "?"}, '
+                f'{attempt} 次截图后仍未到达, 当前: {current or "未知"}'
+            )
+            _log.error('[UI] {}', msg)
+            raise NavigationError(msg, screen=screen)
+
+        time.sleep(interval)
+
+
+def wait_leave_page(
+    ctrl: AndroidController,
+    checker: Callable[[np.ndarray], bool],
+    *,
+    timeout: float = DEFAULT_NAV_CONFIG.timeout,
+    interval: float = DEFAULT_NAV_CONFIG.interval,
+    handle_overlays: bool = True,  # noqa: ARG001
+    source: str = '',
+    target: str = '',
+    candidates: set[str] | None = None,
+    probe: bool = False,
+) -> np.ndarray | None:
+    """反复截图，直到 ``checker`` 返回 ``False`` (已离开)。
+
+    目标页面签名未采集时的降级方案。优先使用 :func:`wait_for_page`。
+
+    .. note::
+       核心等待循环已下沉至 :func:`autowsgr.vision.waiting.wait_until_leaving`
+       (2026-10-11 T3-2 步骤 4: ``combat`` 也需要这套等待能力, 原本它反向
+       import 本模块)。此处保留薄封装, 负责把当前页面名补进日志。
+
+    Parameters
+    ----------
+    candidates:
+        当前页识别的候选页面名集合 (来自 UIStack), 收缩轮询日志中
+        全量识别的搜索空间;``None`` 时全量识别。
+    probe:
+        探测模式 — 超时是**预期结果之一** (如战役次数用尽的出征探测)。
+        超时不抛异常、不保存 NavError 截图，返回 ``None`` 交由调用方判定；
+        超时日志降为 debug，避免预期分支污染错误记录。
+
+    Returns
+    -------
+    np.ndarray | None
+        到达新页面时返回该帧;``probe=True`` 且超时时返回 ``None``。
+
+    Raises
+    ------
+    NavigationError
+        超时仍在原页面 (仅 ``probe=False`` 时)。
+    """
+    from autowsgr.ui.page import get_current_page
+
+    def _describe(screen) -> str | None:
+        """补充"到达了哪个页面"的日志信息 (仅日志用途)。"""
+        return get_current_page(screen, candidates=candidates)
+
+    return wait_until_leaving(
+        ctrl,
+        checker,
+        timeout=timeout,
+        interval=interval,
+        source=source,
+        target=target,
+        probe=probe,
+        on_departed=_describe,
+        error_factory=lambda msg, screen: NavigationError(msg, screen),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 带重试的一步导航 - 推荐 API
+# ---------------------------------------------------------------------------
+
+
+def click_and_wait_for_page(
+    ctrl: AndroidController,
+    click_coord: tuple[float, float],
+    checker: Callable[[np.ndarray], bool],
+    *,
+    source: str = '',
+    target: str = '',
+    config: NavConfig = DEFAULT_NAV_CONFIG,
+    candidates: set[str] | None = None,
+) -> np.ndarray:
+    """点击 + 等待到达目标页面，内置重试。
+
+    Raises
+    ------
+    NavigationError
+        点击后未到达目标页面。
+
+    """
+    ctrl.click(*click_coord)
+    return wait_for_page(
+        ctrl,
+        checker,
+        timeout=config.timeout,
+        interval=config.interval,
+        handle_overlays=config.handle_overlays,
+        source=source,
+        target=target,
+        candidates=candidates,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 确认弹窗操作 (Legacy confirm_operation 风格)
+# ---------------------------------------------------------------------------
+
+
+def confirm_operation(
+    ctrl: AndroidController,
+    *,
+    must_confirm: bool = False,
+    delay: float = 0.5,
+    confidence: float = 0.9,
+    timeout: float = 0.0,
+) -> bool:
+    """等待并点击弹出在屏幕中央的各种确认按钮。
+
+    与 Legacy ``Timer.confirm_operation`` 行为一致:
+    在 *timeout* 时限内反复截图寻找任意确认按钮模板，
+    找到后精确重定位并点击。
+
+    Parameters
+    ----------
+    ctrl:
+        Android 设备控制器实例。
+    must_confirm:
+        为 ``True`` 时，超时未找到确认按钮则抛出异常。
+    delay:
+        点击确认按钮后的睡眠延时 (秒)。
+    confidence:
+        模板匹配置信度阈值。
+    timeout:
+        等待确认弹窗出现的最大时限 (秒); <=0 仅检查当前帧。
+
+    Returns
+    -------
+    bool
+        ``True`` 为找到并点击了确认按钮，``False`` 为未找到。
+
+    Raises
+    ------
+    NavigationError
+        *must_confirm* 为 ``True`` 且超时仍未找到确认按钮。
+    """
+    from autowsgr.image_resources import Templates
+
+    confirm_templates = Templates.Confirm.all()
+    deadline = time.monotonic() + max(timeout, 0)
+
+    while True:
+        screen = ctrl.screenshot()
+        detail = ImageChecker.find_any(
+            screen,
+            confirm_templates,
+            confidence=confidence,
+        )
+        if detail is not None:
+            # 精确重定位 (Legacy 二次匹配风格)
+            screen2 = ctrl.screenshot()
+            detail2 = ImageChecker.find_any(
+                screen2,
+                confirm_templates,
+                confidence=confidence,
+            )
+            if detail2 is not None:
+                detail = detail2
+            ctrl.click(*detail.center)
+            _log.info(
+                "[UI] 确认操作: 点击 '{}' ({:.4f}, {:.4f})",
+                detail.template_name,
+                *detail.center,
+            )
+            time.sleep(delay)
+            return True
+
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.3)
+
+    if must_confirm:
+        raise NavigationError('确认操作超时: 未找到确认按钮', screen=ctrl.screenshot())
+    return False
+
+
+def click_and_wait_leave_page(
+    ctrl: AndroidController,
+    click_coord: tuple[float, float],
+    checker: Callable[[np.ndarray], bool],
+    *,
+    source: str = '',
+    target: str = '',
+    config: NavConfig = DEFAULT_NAV_CONFIG,
+    candidates: set[str] | None = None,
+) -> np.ndarray:
+    """点击 + 等待离开当前页面，内置重试。
+
+    目标页面签名未采集时的降级版本。
+    优先使用 :func:`click_and_wait_for_page`。
+
+    Raises
+    ------
+    NavigationError
+        所有重试均超时。
+    """
+    last_err: NavigationError | None = None
+
+    for attempt in range(1, config.max_retries + 1):
+        if attempt > 1:
+            _log.warning(
+                '[UI] 离开重试 {}/{}: {} -> {} (等 {:.1f}s)',
+                attempt,
+                config.max_retries,
+                source or '?',
+                target or '?',
+                config.retry_delay,
+            )
+            time.sleep(config.retry_delay)
+
+        ctrl.click(*click_coord)
+
+        try:
+            return wait_leave_page(
+                ctrl,
+                checker,
+                timeout=config.timeout,
+                interval=config.interval,
+                handle_overlays=config.handle_overlays,
+                source=source,
+                target=target,
+                candidates=candidates,
+            )
+        except NavigationError as e:
+            last_err = e
+            _log.warning(
+                '[UI] 点击后离开超时 ({}/{}): {} -> {}',
+                attempt,
+                config.max_retries,
+                source or '?',
+                target or '?',
+            )
+
+    raise NavigationError(
+        f'离开失败 (已重试 {config.max_retries} 次): {source or "?"} -> {target or "?"}',
+        screen=ctrl.screenshot(),
+    ) from last_err

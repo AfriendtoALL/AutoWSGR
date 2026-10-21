@@ -1,0 +1,151 @@
+"""模板键枚举 — 替代硬编码字符串。
+
+每个 :class:`TemplateKey` 成员对应一组 :class:`~autowsgr.vision.ImageTemplate`，
+通过 ``.templates`` 属性延迟解析。
+
+Usage::
+
+    from autowsgr.image_resources import TemplateKey
+
+    # 获取模板列表
+    templates = TemplateKey.FORMATION.templates
+
+    # 在识别器签名中使用
+    PhaseSignature(template_key=TemplateKey.FORMATION, ...)
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from functools import lru_cache
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from autowsgr.vision import ImageTemplate
+
+
+class TemplateKey(Enum):
+    """模板标识枚举。
+
+    每个成员的 ``value`` 为人类可读的标识字符串，
+    ``.templates`` 属性返回对应的 ``list[ImageTemplate]``。
+    """
+
+    # ── 战斗阶段 ──
+    FORMATION = 'formation'
+    SPOT_ENEMY = 'spot_enemy'
+    FLAGSHIP_DAMAGE = 'flagship_damage'
+    PROCEED = 'proceed'
+    NIGHT_BATTLE = 'night_battle'
+    FIGHT_CONDITION = 'fight_condition'
+    BYPASS = 'bypass'
+    MISSILE_SUPPORT = 'missile_support'
+    MISSILE_ANIMATION = 'missile_animation'
+    FIGHT_PERIOD = 'fight_period'
+    RESULT_PAGE = 'result_page'
+    GET_SHIP = 'get_ship'
+    GET_ITEM = 'get_item'
+    GET_SHIP_OR_ITEM = 'get_ship_or_item'
+
+    # ── 战斗终止态 ──
+    END_MAP_PAGE = 'end_map_page'
+    END_BATTLE_PAGE = 'end_battle_page'
+    END_EXERCISE_PAGE = 'end_exercise_page'
+
+    # ── 船坞已满 ──
+    DOCK_FULL = 'dock_full'
+
+    # ── 战役次数耗尽 ──
+    BATTLE_TIMES_EXCEED = 'battle_times_exceed'
+
+    # ── 战果评级 ──
+    RESULT_GRADES = 'result_grades'
+    GRADE_SS = 'grade_ss'
+    GRADE_S = 'grade_s'
+    GRADE_A = 'grade_a'
+    GRADE_B = 'grade_b'
+    GRADE_C = 'grade_c'
+    GRADE_D = 'grade_d'
+    GRADE_LOOT = 'grade_loot'
+
+    @property
+    def templates(self) -> list[ImageTemplate]:
+        """返回此键关联的模板列表 (延迟加载)。"""
+        return _resolve(self)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 内部映射 (延迟初始化)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@lru_cache(maxsize=1)
+def _build_map() -> dict[TemplateKey, list[ImageTemplate]]:
+    from autowsgr.image_resources.combat import CombatTemplates as T
+
+    return {
+        TemplateKey.FORMATION: [T.FORMATION],
+        TemplateKey.SPOT_ENEMY: [T.SPOT_ENEMY],
+        TemplateKey.FLAGSHIP_DAMAGE: [T.FLAGSHIP_DAMAGE],
+        TemplateKey.PROCEED: [T.PROCEED],
+        TemplateKey.NIGHT_BATTLE: [T.NIGHT_BATTLE],
+        TemplateKey.FIGHT_CONDITION: [T.FIGHT_CONDITION],
+        TemplateKey.BYPASS: [T.BYPASS],
+        TemplateKey.MISSILE_SUPPORT: [T.MISSILE_SUPPORT],
+        TemplateKey.MISSILE_ANIMATION: [T.MISSILE_ANIMATION],
+        TemplateKey.FIGHT_PERIOD: [T.FIGHT_PERIOD],
+        TemplateKey.RESULT_PAGE: [T.RESULT_PAGE],
+        TemplateKey.GET_SHIP: [T.GET_SHIP],
+        TemplateKey.GET_ITEM: [T.GET_ITEM],
+        TemplateKey.GET_SHIP_OR_ITEM: [T.GET_SHIP, T.GET_ITEM],
+        # 战斗终止态
+        TemplateKey.END_MAP_PAGE: [T.END_MAP_PAGE],
+        TemplateKey.END_BATTLE_PAGE: [T.END_BATTLE_PAGE],
+        TemplateKey.END_EXERCISE_PAGE: [T.END_EXERCISE_PAGE],
+        # 船坞已满
+        TemplateKey.DOCK_FULL: [T.DOCK_FULL],
+        # 战果评级 (SS~D 任一命中即为战果页; 评级字母仅战果页出现)
+        TemplateKey.RESULT_GRADES: T.Result.all_grades(),
+        TemplateKey.GRADE_SS: [T.Result.SS],
+        TemplateKey.GRADE_S: [T.Result.S],
+        TemplateKey.GRADE_A: [T.Result.A],
+        TemplateKey.GRADE_B: [T.Result.B],
+        TemplateKey.GRADE_C: [T.Result.C],
+        TemplateKey.GRADE_D: [T.Result.D],
+        TemplateKey.GRADE_LOOT: [T.Result.LOOT],
+    }
+
+
+def _resolve(key: TemplateKey) -> list[ImageTemplate]:
+    return _build_map()[key]
+
+
+def get_templates(key: TemplateKey) -> list[ImageTemplate]:
+    """通过 :class:`TemplateKey` 枚举获取模板列表。
+
+    这是 ``key.templates`` 属性的函数式等价写法。
+
+    Parameters
+    ----------
+    key:
+        模板键枚举值。
+
+    Returns
+    -------
+    list[ImageTemplate]
+        对应的模板列表。
+    """
+    return _resolve(key)
+
+
+# ── 战果评级映射 (供 detect_result_grade 使用) ──
+
+RESULT_GRADE_KEYS: dict[str, TemplateKey] = {
+    'SS': TemplateKey.GRADE_SS,
+    'S': TemplateKey.GRADE_S,
+    'A': TemplateKey.GRADE_A,
+    'B': TemplateKey.GRADE_B,
+    'C': TemplateKey.GRADE_C,
+    'D': TemplateKey.GRADE_D,
+}

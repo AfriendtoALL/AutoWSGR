@@ -1,0 +1,46 @@
+"""模拟器层 — 设备控制与进程管理。
+
+提供两大核心能力：
+
+1. **设备控制** (`AndroidController` / `ScrcpyController`)：
+   截图、点击、滑动、按键、应用管理等纯设备操作。
+   所有触控坐标使用相对值 (0.0-1.0)。
+
+2. **进程管理** (`EmulatorProcessManager` / `create_emulator_manager`)：
+   在宿主操作系统上启动、停止、检测模拟器进程。
+"""
+
+from .controller import (
+    AndroidController,
+    DeviceInfo,
+    ScrcpyController,
+)
+from .detector import (
+    EmulatorCandidate,
+    detect_emulators,
+    prompt_user_select,
+    resolve_serial,
+)
+from .os_control import (
+    EmulatorProcessManager,
+    LinuxEmulatorManager,
+    MacEmulatorManager,
+    WindowsEmulatorManager,
+    create_emulator_manager,
+)
+
+
+__all__ = [
+    'AndroidController',
+    'DeviceInfo',
+    'EmulatorCandidate',
+    'EmulatorProcessManager',
+    'LinuxEmulatorManager',
+    'MacEmulatorManager',
+    'ScrcpyController',
+    'WindowsEmulatorManager',
+    'create_emulator_manager',
+    'detect_emulators',
+    'prompt_user_select',
+    'resolve_serial',
+]

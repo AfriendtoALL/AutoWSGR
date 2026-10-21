@@ -1,0 +1,58 @@
+# Release & Publish — 版本号变更时自动触发，也可手动触发
+# 创建 GitHub Release + 发布到 PyPI，不依赖 lint
+name: Release & Publish
+
+on:
+  push:
+    branches: [main]
+    paths: [autowsgr/__init__.py]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'OpenWSGR/AutoWSGR'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(uv run python -c "exec(open('autowsgr/__init__.py').read()); print(__version__)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.version.outputs.tag }}" | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag and release
+        if: steps.check_tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" \
+            --title "AutoWSGR $VERSION" \
+            --generate-notes \
+            --latest
+
+      - name: Build package
+        run: uv build
+
+      - name: Publish to PyPI
+        if: steps.check_tag.outputs.exists == 'false'
+        run: uv publish --token '${{ secrets.PYPI_API_TOKEN }}'

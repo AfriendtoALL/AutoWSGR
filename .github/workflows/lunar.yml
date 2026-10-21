@@ -1,0 +1,28 @@
+name: Lunar Code Review
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  test:
+    if: github.repository == 'OpenWSGR/AutoWSGR'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: 0xWelt/Lunar@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # # Optional, change as you wish or comment out to use default
+          # LLM settings
+          OPENAI_BASE_URL: ${{ vars.LUNAR_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.LUNAR_API_KEY }}
+          MODEL: ${{ vars.LUNAR_MODEL }}
+          TEMPERATURE: 1.0
+          MAX_TOKENS: 8192
+          # Lunar settings
+          LANGUAGE: Chinese
+          IGNORE_PATTERNS: autowsgr/data/**/* # glob pattern or regex pattern to ignore files, separated by comma

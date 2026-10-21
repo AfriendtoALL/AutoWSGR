@@ -1,0 +1,284 @@
+"""侧边栏页面 UI 控制器。
+
+覆盖游戏 **侧边栏** (左下角 ≡ 菜单) 的导航交互。
+
+已完成
+
+使用方式::
+
+    from autowsgr.ui.sidebar_page import SidebarPage, SidebarTarget
+
+    page = SidebarPage(ctrl)
+
+    # 页面识别
+    screen = ctrl.screenshot()
+    if SidebarPage.is_current_page(screen):
+        page.navigate_to(SidebarTarget.BUILD)
+
+    # 关闭侧边栏
+    page.close()
+"""
+
+from __future__ import annotations
+
+import enum
+import time
+from typing import TYPE_CHECKING
+
+from autowsgr.image_resources import Templates
+from autowsgr.infra.logger import get_logger
+from autowsgr.types import PageName
+from autowsgr.ui.utils import click_and_wait_for_page, wait_for_page
+from autowsgr.vision import ImageChecker, PageMatch
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    import numpy as np
+
+    from autowsgr.context import GameContext
+
+
+_log = get_logger('ui')
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 枚举
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class SidebarTarget(enum.Enum):
+    """侧边栏可导航的目标。"""
+
+    BUILD = '建造'
+    INTENSIFY = '强化'
+    FRIEND = '好友'
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 页面识别签名
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 页面级识别已改用 Templates.Page.SIDEBAR 模板匹配 (迁移自 classic options_page),
+# 详见 :meth:`SidebarPage.is_current_page`。
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 导航按钮点击坐标
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CLICK_NAV: dict[SidebarTarget, tuple[float, float]] = {
+    SidebarTarget.BUILD: (0.1563, 0.3704),
+    SidebarTarget.INTENSIFY: (0.1563, 0.5000),
+    SidebarTarget.FRIEND: (0.1563, 0.7593),
+}
+"""侧边栏菜单项点击坐标。
+
+坐标换算: 旧代码 (150, 200) / (150, 270) / (150, 410) ÷ (960, 540)。
+"""
+
+CLICK_CLOSE: tuple[float, float] = (0.0438, 0.8963)
+"""关闭侧边栏 (左下角 ≡ 同一切换按钮)。"""
+
+CLICK_SUBMENU: dict[SidebarTarget, tuple[float, float]] = {
+    SidebarTarget.BUILD: (0.375, 0.3704),
+    SidebarTarget.INTENSIFY: (0.375, 0.5000),
+}
+"""二级弹出菜单点击坐标。
+
+建造 和 强化 点击后会弹出子选项菜单 (如 建造/特别船坞)，
+需要二次点击选中第一个选项。坐标来自旧代码 (360, 200)/(360, 270) ÷ (960, 540)。
+"""
+
+_SUBMENU_TARGETS: frozenset[SidebarTarget] = frozenset(
+    {
+        SidebarTarget.BUILD,
+        SidebarTarget.INTENSIFY,
+    }
+)
+"""需要二级菜单点击的导航目标。"""
+
+SUBMENU_DELAY: float = 1.25
+"""点击菜单项后等待二级菜单弹出的延迟 (秒)。"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 页面控制器
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class SidebarPage:
+    """侧边栏页面控制器。
+
+    **状态查询** 为 ``staticmethod``，只需截图即可调用。
+    **操作动作** 为实例方法，通过注入的控制器执行。
+
+    Parameters
+    ----------
+    ctrl:
+        Android 设备控制器实例。
+    """
+
+    def __init__(self, ctx: GameContext) -> None:
+        self._ctx = ctx
+        self._ctrl = ctx.ctrl
+
+    # ── 页面识别 ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def is_current_page(screen: np.ndarray) -> PageMatch:
+        """判断截图是否为侧边栏页面。
+
+        用侧边栏独有的大区域模板 (classic ``options_page``) 匹配。
+        正样本置信度约 0.86 (大模板含背景, 易随主题波动), 故阈值放宽到 0.8;
+        其他页最高仅 0.32, 区分度充足。
+
+        Parameters
+        ----------
+        screen:
+            截图 (HxWx3, RGB)。
+        """
+        result = ImageChecker.find_template(screen, Templates.Page.SIDEBAR, confidence=0.8)
+        name = PageName.SIDEBAR.value
+        if result is None:
+            return PageMatch(name=name, matched=False, score=0.0)
+        return PageMatch(name=name, matched=True, score=result.confidence)
+
+    # ── 导航 ──────────────────────────────────────────────────────────────
+
+    def navigate_to(self, target: SidebarTarget) -> None:
+        """点击菜单项，进入指定子页面。
+
+        建造 / 强化 需要二级菜单选择 (点击侧边栏项 → 等待弹出 → 点击子选项)。
+        好友 直接单次点击。
+
+        Parameters
+        ----------
+        target:
+            导航目标。
+
+        Raises
+        ------
+        NavigationError
+            超时未到达目标页面。
+        """
+        from autowsgr.ui.build_page import BuildPage
+        from autowsgr.ui.friend_page import FriendPage
+        from autowsgr.ui.intensify_page import IntensifyPage
+
+        target_checker = {
+            SidebarTarget.BUILD: BuildPage.is_current_page,
+            SidebarTarget.INTENSIFY: IntensifyPage.is_current_page,
+            SidebarTarget.FRIEND: FriendPage.is_current_page,
+        }
+        _log.info('[UI] 侧边栏 → {}', target.value)
+
+        if target in _SUBMENU_TARGETS:
+            # 二级菜单: 点击侧边栏项 → 等弹出 → 点击子选项 → 验证
+            self._navigate_with_submenu(
+                target,
+                target_checker[target],
+            )
+        else:
+            # 单次点击 (好友)
+            click_and_wait_for_page(
+                self._ctrl,
+                click_coord=CLICK_NAV[target],
+                checker=target_checker[target],
+                source=PageName.SIDEBAR,
+                target=target.value,
+            )
+
+    def _navigate_with_submenu(
+        self,
+        target: SidebarTarget,
+        checker: Callable,
+    ) -> None:
+        """带二级弹出菜单的导航 (建造 / 强化)。
+
+        流程: 点击侧边栏项 → 等待弹出 → 点击子选项 → 验证到达目标页面。
+        整个流程带重试。
+        """
+        from autowsgr.ui.utils import DEFAULT_NAV_CONFIG, NavigationError
+
+        config = DEFAULT_NAV_CONFIG
+        last_err: NavigationError | None = None
+
+        for attempt in range(1, config.max_retries + 1):
+            if attempt > 1:
+                _log.warning(
+                    '[UI] 二级菜单重试 {}/{}: 侧边栏 → {} (等 {:.1f}s)',
+                    attempt,
+                    config.max_retries,
+                    target.value,
+                    config.retry_delay,
+                )
+                time.sleep(config.retry_delay)
+
+            # Step 1: 点击侧边栏菜单项
+            self._ctrl.click(*CLICK_NAV[target])
+            # Step 2: 等待二级弹出菜单出现
+            time.sleep(SUBMENU_DELAY)
+            # Step 3: 点击子选项
+            self._ctrl.click(*CLICK_SUBMENU[target])
+
+            try:
+                wait_for_page(
+                    self._ctrl,
+                    checker,
+                    timeout=config.timeout,
+                    interval=config.interval,
+                    handle_overlays=config.handle_overlays,
+                    source=PageName.SIDEBAR,
+                    target=target.value,
+                )
+            except NavigationError as e:
+                last_err = e
+                _log.warning(
+                    '[UI] 二级菜单后超时 ({}/{}): 侧边栏 → {}',
+                    attempt,
+                    config.max_retries,
+                    target.value,
+                )
+            else:
+                return
+
+        raise NavigationError(
+            f'导航失败 (已重试 {config.max_retries} 次): 侧边栏 → {target.value}',
+            screen=self._ctrl.screenshot(),
+        ) from last_err
+
+    def go_to_build(self) -> None:
+        """点击「建造」— 进入建造页面。"""
+        self.navigate_to(SidebarTarget.BUILD)
+
+    def go_to_intensify(self) -> None:
+        """点击「强化」— 进入强化页面。"""
+        self.navigate_to(SidebarTarget.INTENSIFY)
+
+    def go_to_friend(self) -> None:
+        """点击「好友」— 进入好友页面。"""
+        self.navigate_to(SidebarTarget.FRIEND)
+
+    # ── 关闭 ──────────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """关闭侧边栏，返回主页面。
+
+        点击后反复截图验证，确认已到达主页面。
+
+        Raises
+        ------
+        NavigationError
+            超时未关闭侧边栏。
+        """
+        from autowsgr.ui.main_page import MainPage
+
+        _log.info('[UI] 侧边栏 → 关闭 (返回主页面)')
+        click_and_wait_for_page(
+            self._ctrl,
+            click_coord=CLICK_CLOSE,
+            checker=MainPage.is_current_page,
+            source=PageName.SIDEBAR,
+            target=PageName.MAIN,
+        )

@@ -1,0 +1,140 @@
+"""决战控制器配置与地图数据。"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+
+from autowsgr.infra.file_utils import load_yaml
+from autowsgr.infra.logger import get_logger
+
+
+_log = get_logger('decisive')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 地图静态数据
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 数据来源: autowsgr_legacy/data/map/decisive_battle/enemy_spec.yaml
+# map_end[chapter][stage] → 该小关最后一个节点字母
+# chapter 索引 0 为占位; 有效章节 1-6; stage 索引 0 为占位, 有效小关 1-3。
+_MAP_END: list[str] = [
+    '',  # 0: 占位
+    ' FHH',  # chapter 1: stage1=F, stage2=H, stage3=H
+    ' FHH',  # chapter 2
+    ' HHJ',  # chapter 3
+    ' HHJ',  # chapter 4
+    ' HJJ',  # chapter 5
+    ' JJJ',  # chapter 6
+]
+
+# key_points[chapter][stage] → 需要夜战的关键节点字母集合
+_KEY_POINTS: dict[int, list[str]] = {
+    1: ['', 'BDF', 'BFH', 'DHJ'],
+    2: ['', 'CFH', 'BFH', 'DHJ'],
+    3: ['', 'CFH', 'BFH', 'DHJ'],
+    4: ['', 'CFH', 'BFH', 'DHJ'],
+    5: ['', 'DFH', 'DGJ', 'CGJ'],
+    6: ['', 'BGJ', 'CHJ', 'DGJ'],
+}
+
+
+@lru_cache(maxsize=1)
+def _load_enemy_spec_data() -> dict:
+    """加载决战 enemy_spec.yaml 数据。"""
+    data_path = (
+        Path(__file__).resolve().parents[2] / 'data' / 'map' / 'decisive_battle' / 'enemy_spec.yaml'
+    )
+    return load_yaml(data_path)
+
+
+class MapData:
+    """决战地图静态数据查询。
+
+    封装 ``map_end`` 与 ``key_points``，提供按 *chapter / stage* 查询的方法。
+    """
+
+    @staticmethod
+    def get_stage_end_node(chapter: int, stage: int) -> str:
+        """获取指定章节、小关的终止节点字母。
+
+        Parameters
+        ----------
+        chapter:
+            章节编号 (1-6)。
+        stage:
+            小关编号 (1-3)。
+
+        Returns
+        -------
+        str
+            终止节点字母 (如 ``'H'``, ``'J'``)。
+            若 chapter/stage 超出范围，返回 ``'J'`` 作为安全回退。
+        """
+        if 1 <= chapter < len(_MAP_END) and 1 <= stage <= 3:
+            return _MAP_END[chapter][stage]
+        raise ValueError(f'无效章节/小关: chapter={chapter}, stage={stage}')
+
+    @staticmethod
+    def is_stage_end(chapter: int, stage: int, node: str) -> bool:
+        """判断当前节点是否为该小关的终止节点。
+
+        Parameters
+        ----------
+        chapter:
+            章节编号 (1-6)。
+        stage:
+            小关编号 (1-3)。
+        node:
+            当前节点字母 (如 ``'A'``, ``'H'``)。
+        """
+        return node == MapData.get_stage_end_node(chapter, stage)
+
+    @staticmethod
+    def get_key_points(chapter: int, stage: int) -> set[str]:
+        """获取指定章节、小关的关键节点集合 (需夜战)。
+
+        Parameters
+        ----------
+        chapter:
+            章节编号 (4-6)。
+        stage:
+            小关编号 (1-3)。
+
+        Returns
+        -------
+        set[str]
+            关键节点字母集合；未找到时返回空集。
+        """
+        kps = _KEY_POINTS.get(chapter, [])
+        if 1 <= stage < len(kps):
+            return set(kps[stage])
+        return set()
+
+    @staticmethod
+    def is_key_point(chapter: int, stage: int, node: str) -> bool:
+        """判断当前节点是否为关键点 (需夜战)。"""
+        return node in MapData.get_key_points(chapter, stage)
+
+    @staticmethod
+    def get_enemy(chapter: int, stage: int, node: str) -> list[str]:
+        """获取指定章节/小关/节点的敌方编成。"""
+        try:
+            data = _load_enemy_spec_data()
+            enemy_data = data.get('enemy', [])
+            chapter_data = enemy_data[chapter]
+            stage_data = chapter_data[stage]
+            node_data = stage_data.get(node.upper())
+            if isinstance(node_data, list):
+                return [str(x) for x in node_data if x]
+        except Exception:
+            _log.debug(
+                '[决战] 敌方规格数据查询失败: chapter={}, stage={}, node={}',
+                chapter,
+                stage,
+                node,
+                exc_info=True,
+            )
+            return []
+        return []

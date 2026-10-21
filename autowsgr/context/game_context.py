@@ -1,0 +1,326 @@
+"""顶层游戏上下文 — 基础设施 + 运行时状态聚合。"""
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from autowsgr.infra.logger import get_logger
+from autowsgr.types import ShipDamageState
+from autowsgr.ui.stack import UIStack
+
+from .bathroom import BathRoom
+from .build import BuildQueue
+from .expedition import ExpeditionQueue
+from .fleet import Fleet
+from .resources import Resources
+from .ship import Ship
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from datetime import date
+
+    from autowsgr.combat.history import CombatResult
+    from autowsgr.emulator import AndroidController
+    from autowsgr.infra import UserConfig
+    from autowsgr.types import PageName
+    from autowsgr.ui.map.panels.sortie import LootShipCount
+    from autowsgr.vision import OCREngine
+
+
+_log = get_logger('context')
+
+# 游戏固定 4 支舰队
+_NUM_FLEETS = 4
+
+
+def _default_fleets() -> list[Fleet]:
+    return [Fleet(fleet_id=i) for i in range(1, _NUM_FLEETS + 1)]
+
+
+def _default_drop_counts_interactor(ctx: GameContext) -> 'LootShipCount':
+    """读取每日掉落计数的默认实现 (含全部 UI 交互)。
+
+    **ui / ops 的依赖集中在这里, 且只在函数内导入** —— ``context`` 层
+    本身不依赖它们 (2026-10-11 T3-2 步骤 5)。测试可注入替身绕开设备。
+    """
+    from autowsgr.ops import goto_page
+    from autowsgr.types import PageName
+    from autowsgr.ui import MapPage, MapPanel
+
+    goto_page(ctx, PageName.MAP)
+    map_page = MapPage(ctx)
+    map_page.ensure_panel(MapPanel.SORTIE)
+    time.sleep(0.25)
+    # OCR 引擎不可用时 get_loot_and_ship_count 抛 RuntimeError — 不吞, 上抛
+    counts = map_page.get_loot_and_ship_count()
+    try:
+        goto_page(ctx, PageName.MAIN)
+    except Exception:
+        _log.warning('[Context] 每日掉落计数同步后返回主页面失败')
+    return counts
+
+
+@dataclass
+class GameContext:
+    """游戏运行时上下文 — 持有基础设施引用与可观测游戏状态。
+
+    构造时由调度层 (:mod:`autowsgr.scheduler.launcher`) 注入
+    ``ctrl`` / ``config`` / ``ocr``，各子模块通过 ``ctx`` 获取
+    共享服务，不再各自创建。
+
+    Attributes (基础设施)
+    ---------------------
+    ctrl : AndroidController
+        设备控制器 (截图 + 触控)。
+    config : UserConfig
+        用户配置 (只读)。
+    ocr : OCREngine | None
+        OCR 引擎实例 (可选，创建后复用)。
+
+    Attributes (游戏状态)
+    ----------------------
+    resources, fleets, expeditions, build_queue, current_page, …
+        从游戏画面中读取 / 推断出的动态数据。
+    """
+
+    # ── 基础设施引用 (必填) ──
+
+    ctrl: AndroidController
+    """设备控制器 (截图 + 触控)。"""
+    config: UserConfig
+    """用户配置 (只读)。"""
+
+    # ── 基础设施引用 (可选) ──
+
+    ocr: OCREngine
+    """OCR 引擎实例 (章节/阵型识别等)。"""
+    ship_ocr: OCREngine | None = None
+    """增强船只识别 OCR 引擎 (FastOCR + PP-OCRv6-small, 可选)。
+
+    仅在 ``config.ocr.enhanced_ship_ocr`` 开启时由启动器注入；
+    船只名称 / 等级 / 舰种识别节点优先使用它，其余节点仍走 ``ocr``。
+    """
+
+    # ── 游戏运行时状态 ──
+
+    resources: Resources = field(default_factory=Resources)
+    """当前资源。"""
+    fleets: list[Fleet] = field(default_factory=_default_fleets)
+    """四支舰队 (fleet_id 1-4)。"""
+    expeditions: ExpeditionQueue = field(default_factory=ExpeditionQueue)
+    """远征队列。"""
+    build_queue: BuildQueue = field(default_factory=BuildQueue)
+    """建造队列。"""
+    bathroom: BathRoom = field(default_factory=BathRoom)
+    """浴室修理槽位状态 (空位调度用)。"""
+    ship_registry: dict[str, Ship] = field(default_factory=dict)
+    """舰船注册表, 以名称为键。"""
+    ui_stack: UIStack = field(default_factory=UIStack)
+    """UI 导航栈 — 页面来路追踪。
+
+    识别候选剪枝与 go_back 期望父页的来源, 由导航循环
+    (:func:`autowsgr.ops.navigate._goto_page`) 维护。
+    """
+    current_page: PageName | None = None
+    """当前游戏页面。
+
+    .. deprecated::
+        改读 :attr:`ui_stack.current`。本字段由导航循环尽力同步
+        (页面名不在 :class:`~autowsgr.types.PageName` 枚举内时为 ``None``),
+        仅为 server 状态上报等旧读者保留。
+    """
+
+    # ── 每日计数器 ──
+
+    dropped_ship_count: int = 0
+    """当天掉落舰船数。"""
+    dropped_loot_count: int = 0
+    """当天掉落胖次数。"""
+    quick_repair_used: int = 0
+    """本次会话已消耗快修数。"""
+
+    daily_overlay_date: date | None = None
+    """最近一次完成主页面浮层处理的日期 (时间戳 gate: 每日 0 点后首次处理, 跨日失效)。"""
+
+    overlay_ready_maps: set[tuple[str | None, str, str | None]] = field(
+        default_factory=set
+    )
+    """"上一场成功打完、战后回港弹层可直接复用再出击"的关卡身份集合。
+
+    键 = ``(活动代号, 地图代码, 入口)``, 详见
+    :attr:`autowsgr.ops.normal_fight.NormalFightRunner._overlay_key`。
+
+    **为什么放在 ctx 而非 runner 类变量** (2026-10-11):
+
+    触发器模式每轮经 ``plan.factory(ctx)`` 新建 runner, 实例属性每轮归零,
+    导致弹层复用从不生效 (实机 2026-10-08: 每轮都日志「已关闭残留关卡
+    浮层」)。原先把该状态挂在 ``NormalFightRunner._overlay_ready`` 类变量上,
+    但类变量是**进程级**的 —— 同进程跑不同计划会共享、进程重启即丢失、
+    且永不清理。
+
+    ctx 的生命周期恰好匹配: 触发器模式下同一 ctx 跨轮存活 (见
+    ``scheduler/triggers.py`` 的 ``plan.factory(ctx)``), 进程级共享问题
+    也随之消失。
+    """
+
+    active_fight_tasks: int = 0
+    """当前正在执行的战斗任务数。由 TaskScheduler 维护，用于判断是否可以安全执行浴室维修等会占用舰队的操作。"""
+
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    """任务停止信号 (由 TaskManager 设置)。"""
+
+    drop_counts_interactor: Callable[['GameContext'], object] | None = None
+    """读取每日掉落计数的交互实现 (返回含 ``ship``/``loot`` 的对象)。
+
+    ``None`` 时用 :func:`_default_drop_counts_interactor`。注入点用于测试 ——
+    默认实现需要真实设备 (导航到出征面板 + OCR 读数)。
+    """
+
+    # ── 便捷访问 ──
+
+    def fleet(self, fleet_id: int) -> Fleet:
+        """按编号 (1-4) 获取舰队。"""
+        if not 1 <= fleet_id <= len(self.fleets):
+            raise ValueError(f'fleet_id 应在 1-{len(self.fleets)} 范围内，收到 {fleet_id}')
+        return self.fleets[fleet_id - 1]
+
+    def get_ship(self, name: str) -> Ship:
+        """按名称获取舰船, 不存在则自动注册。"""
+        if name not in self.ship_registry:
+            self.ship_registry[name] = Ship(name=name)
+        return self.ship_registry[name]
+
+    def is_ship_available(self, name: str) -> bool:
+        """判断舰船是否可用 (非大破 且 非修理中)。"""
+        return self.get_ship(name).available
+
+    def update_ship_damage(self, name: str, state: ShipDamageState) -> None:
+        """更新舰船的破损状态。"""
+        self.get_ship(name).damage_state = state
+
+    # ── 战斗上下文同步 ──
+
+    def sync_before_combat(
+        self,
+        fleet_id: int,
+        ships: list[Ship] | None = None,
+        *,
+        loot_count: int | None = None,
+        ship_acquired_count: int | None = None,
+    ) -> None:
+        """战斗开始前, 用识别到的信息更新上下文。
+
+        Parameters
+        ----------
+        fleet_id:
+            出击舰队编号 (1-4)。
+        ships:
+            从准备页面识别到的舰船列表 (含等级、血量状态)。
+        loot_count:
+            今日已获取战利品数量 (出征面板识别)。
+        ship_acquired_count:
+            今日已获取舰船数量 (出征面板识别)。
+        """
+        # 同步每日计数器
+        if loot_count is not None:
+            self.dropped_loot_count = loot_count
+            _log.debug('[Context] 今日战利品数: {}', loot_count)
+        if ship_acquired_count is not None:
+            self.dropped_ship_count = ship_acquired_count
+            _log.debug('[Context] 今日舰船数: {}', ship_acquired_count)
+
+        # 同步出击舰队信息
+        if ships is not None:
+            fleet = self.fleet(fleet_id)
+            fleet.ships = ships
+            # 同步到舰船注册表
+            for s in ships:
+                if s.name:
+                    registered = self.get_ship(s.name)
+                    registered.level = s.level or registered.level
+                    registered.damage_state = s.damage_state
+            _log.info(
+                '[Context] 舰队 {} 出击编成: {}',
+                fleet_id,
+                ', '.join(f'{s.name or "?"} Lv.{s.level}' for s in ships),
+            )
+
+    def sync_after_combat(
+        self,
+        fleet_id: int,
+        result: CombatResult,
+    ) -> None:
+        """战斗结束后, 用结果更新上下文。
+
+        Parameters
+        ----------
+        fleet_id:
+            出击舰队编号 (1-4)。
+        result:
+            战斗结果。
+        """
+        from autowsgr.types import ConditionFlag
+
+        if result.flag not in (
+            ConditionFlag.OPERATION_SUCCESS,
+            ConditionFlag.FIGHT_END,
+        ):
+            return
+
+        # 更新舰队战后血量
+        fleet = self.fleet(fleet_id)
+        for i, ship in enumerate(fleet.ships):
+            if i < len(result.ship_stats):
+                state = result.ship_stats[i]
+                if state != ShipDamageState.NO_SHIP:
+                    ship.damage_state = state
+                    if ship.name:
+                        self.get_ship(ship.name).damage_state = state
+
+        # 统计本次掉落舰船数
+        fight_results = result.fight_results
+        new_drops = sum(1 for fr in fight_results if fr.dropped_ship)
+        if new_drops:
+            self.dropped_ship_count += new_drops
+            _log.info('[Context] 本次掉落 {} 艘, 今日累计 {}', new_drops, self.dropped_ship_count)
+
+        _log.debug(
+            '[Context] 舰队 {} 战后状态: {}',
+            fleet_id,
+            [s.damage_state.name for s in fleet.ships],
+        )
+
+    def sync_daily_drop_counts(self) -> None:
+        """导航到出征面板, 识别今日已获取舰船/战利品数并同步每日计数器。
+
+        .. note::
+            重构后已移除 ``stop_max_ship`` / ``stop_max_loot`` 上限, 这两个
+            计数器不再用于门控常规战触发器, 仅作信息统计。本方法保留以便
+            需要时手动校准。
+
+        .. note::
+            UI 交互(导航/打开面板/读取计数)通过 ``interactor`` 参数注入
+            (2026-10-11 T3-2 步骤 5: ``context`` 层不该 import ``ui``/``ops``)。
+            默认为 :func:`_default_drop_counts_interactor`, 行为与迁移前一致。
+
+        Raises
+        ------
+        RuntimeError
+            OCR 引擎不可用, 无法识别掉落数量。
+        """
+        interactor = self.drop_counts_interactor or _default_drop_counts_interactor
+        counts = interactor(self)
+
+        if counts.ship is not None:
+            self.dropped_ship_count = counts.ship
+        if counts.loot is not None:
+            self.dropped_loot_count = counts.loot
+        _log.info(
+            '[Context] 每日掉落计数同步: 舰船 {}, 战利品 {}',
+            counts.ship,
+            counts.loot,
+        )

@@ -1,0 +1,767 @@
+"""NormalFightRunner event/normal 融合分支单元测试。
+
+不依赖实机: 用轻量 mock ctx 验证 ``plan.chapter`` (E/H vs 数字) → 导航分支的
+路由逻辑 (event 走活动地图, normal 走常规出征面板)。
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
+
+import autowsgr.ops.normal_fight as normal_fight_module
+from autowsgr.combat import CombatMode, CombatPlan, CombatResult
+from autowsgr.combat.fleet import (
+    FleetSelectionSource,
+    FleetSlotRule,
+    ShipSelector,
+    exact_fleet_rules,
+    resolve_fleet_selection,
+)
+from autowsgr.infra import ActionFailedError
+from autowsgr.ops.normal_fight import NormalFightRunner, _require_fleet_change
+from autowsgr.types import ConditionFlag, PageName, ShipDamageState, ShipType
+from autowsgr.ui.battle.fleet_change._detect import FleetSnapshot
+
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+
+def _make_ctx() -> SimpleNamespace:
+    """构造满足 NormalFightRunner.__init__ 的最小 ctx mock。
+
+    构造期仅访问 ``ctx.ctrl`` (存引用) 与 ``ctx.config`` 的两个拆船字段,
+    不触发任何实机操作。
+    """
+
+    cfg = SimpleNamespace(dock_full_destroy=False, destroy_ship_types=None)
+    return SimpleNamespace(ctrl=None, config=cfg)
+
+
+class TestFleetChangeResult:
+    def test_success_continues(self):
+        _require_fleet_change(True, 'fleet')
+
+    def test_failure_stops_fight(self):
+        with pytest.raises(ActionFailedError, match='fleet 编队失败'):
+            _require_fleet_change(False, 'fleet')
+
+
+class TestFleetPresetRules:
+    def test_plan_preset_is_used_without_api_override(self):
+        ships = [
+            {
+                'name': 'U-47',
+                'candidates': [{'name': 'U-96'}],
+            },
+        ]
+        plan = CombatPlan.from_dict(
+            {
+                'fleet_presets': [
+                    {
+                        'name': '潜艇队',
+                        'ships': ships,
+                    },
+                ],
+            },
+        )
+
+        selection = resolve_fleet_selection(plan)
+        runner = NormalFightRunner(_make_ctx(), plan, selection)
+
+        assert runner._fleet_selection is selection
+        assert selection.source is FleetSelectionSource.PLAN_PRESET
+        assert selection.slot_rules is not None
+        assert selection.slot_rules[0].primary == ShipSelector(name='U-47')
+        assert selection.primary_names == ['U-47']
+
+    def test_api_rules_override_plan_preset(self):
+        plan = CombatPlan.from_dict(
+            {
+                'fleet_presets': [
+                    {
+                        'name': '计划编队',
+                        'ships': [{'name': 'U-47'}],
+                    },
+                ],
+            },
+        )
+        override = (FleetSlotRule(primary=ShipSelector(name='岛风')),)
+        selection = resolve_fleet_selection(plan, slot_rules=override)
+
+        runner = NormalFightRunner(_make_ctx(), plan, selection)
+
+        assert runner._fleet_selection.slot_rules == override
+        assert runner._fleet_selection.source is FleetSelectionSource.OVERRIDE_RULES
+
+    def test_candidate_only_slot_has_no_fixed_primary_name(self):
+        rules = (
+            FleetSlotRule(
+                candidates=(
+                    ShipSelector(name='胡德', relaxed_constraints=True),
+                    ShipSelector(name='扶桑', relaxed_constraints=True),
+                ),
+            ),
+        )
+        selection = resolve_fleet_selection(
+            CombatPlan(),
+            slot_rules=rules,
+        )
+
+        assert selection.primary_names == [None]
+
+    @pytest.mark.parametrize(
+        ('fleet', 'slot_rules', 'expected_source'),
+        [
+            (['岛风'], None, FleetSelectionSource.OVERRIDE_FLEET),
+            (
+                ['岛风'],
+                (FleetSlotRule(primary=ShipSelector(name='雪风')),),
+                FleetSelectionSource.OVERRIDE_RULES,
+            ),
+        ],
+    )
+    def test_override_priority_is_centralized(
+        self,
+        fleet: list[str],
+        slot_rules: tuple[FleetSlotRule, ...] | None,
+        expected_source: FleetSelectionSource,
+    ):
+        plan = CombatPlan.from_dict(
+            {
+                'fleet': ['飞龙'],
+                'fleet_presets': [{'ships': [{'name': 'U-47'}]}],
+            },
+        )
+
+        selection = resolve_fleet_selection(
+            plan,
+            fleet=fleet,
+            slot_rules=slot_rules,
+        )
+
+        assert selection.source is expected_source
+
+    def test_plan_preset_has_priority_over_plain_plan_fleet(self):
+        plan = CombatPlan.from_dict(
+            {
+                'fleet': ['飞龙'],
+                'fleet_presets': [{'ships': [{'name': 'U-47'}]}],
+            },
+        )
+
+        selection = resolve_fleet_selection(plan)
+
+        assert selection.source is FleetSelectionSource.PLAN_PRESET
+
+
+class _FleetInfo:
+    def __init__(self) -> None:
+        self.ship_damage: dict[int, ShipDamageState] = {}
+
+    @staticmethod
+    def to_ships(_names: list[str | None] | None) -> list[object]:
+        return []
+
+
+class _BattlePreparationPage:
+    def __init__(self) -> None:
+        self.changed_fleet_id: int | None = None
+        self.changed_rules: tuple[FleetSlotRule, ...] | None = None
+        self.last_changed_fleet: list[str | None] | None = ['导巡测试舰']
+
+    @staticmethod
+    def select_fleet(_fleet_id: int) -> None:
+        return None
+
+    def change_fleet(
+        self,
+        fleet_id: int,
+        rules: tuple[FleetSlotRule, ...],
+    ) -> bool:
+        self.changed_fleet_id = fleet_id
+        self.changed_rules = rules
+        return True
+
+    @staticmethod
+    def detect_fleet() -> list[str]:
+        raise AssertionError('runner 不应在换船成功后重复识别舰队')
+
+    @staticmethod
+    def apply_supply() -> None:
+        return None
+
+    @staticmethod
+    def apply_repair(_strategy: object) -> None:
+        return None
+
+    @staticmethod
+    def detect_fleet_info() -> _FleetInfo:
+        return _FleetInfo()
+
+    @staticmethod
+    def start_battle() -> None:
+        return None
+
+
+class TestFleetSelectionCallChain:
+    def test_runner_constructor_keeps_legacy_fleet_arguments(self):
+        plan = CombatPlan.from_dict({'fleet': ['岛风']})
+        runner = NormalFightRunner(_make_ctx(), plan, fleet_id=2)
+
+        assert runner._fleet_id == 2
+        assert runner._fleet_selection.plain_fleet == ('岛风',)
+
+    def test_event_runner_constructor_keeps_legacy_fleet_arguments(self):
+        from autowsgr.ops.event_fight import EventFightRunner
+
+        plan = CombatPlan.from_dict({'chapter': 'H', 'map': '1a', 'fleet': ['岛风']})
+        runner = EventFightRunner(_make_ctx(), plan, fleet_id=2)
+
+        assert runner._fleet_id == 2
+        assert runner._fleet_selection.plain_fleet == ('岛风',)
+
+    @pytest.mark.parametrize(
+        'legacy_args',
+        [
+            {'fleet_id': 2},
+            {'fleet': ['雪风']},
+            {'fleet_rules': exact_fleet_rules(['雪风'])},
+        ],
+    )
+    def test_runner_rejects_explicit_selection_with_legacy_overrides(
+        self,
+        legacy_args: dict[str, Any],
+    ):
+        plan = CombatPlan.from_dict({'fleet': ['岛风']})
+        selection = resolve_fleet_selection(plan)
+
+        with pytest.raises(ValueError, match='不能同时传入'):
+            NormalFightRunner(_make_ctx(), plan, selection, **legacy_args)
+
+    @pytest.mark.parametrize(
+        ('fleet', 'slot_rules'),
+        [([], None), (None, [])],
+    )
+    def test_resolver_rejects_empty_explicit_overrides(
+        self,
+        fleet: Sequence[str] | None,
+        slot_rules: Sequence[FleetSlotRule] | None,
+    ):
+        with pytest.raises(ValueError, match='不能为空'):
+            resolve_fleet_selection(CombatPlan(), fleet=fleet, slot_rules=slot_rules)
+
+    def _prepare(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        plan: CombatPlan,
+    ) -> tuple[object, _BattlePreparationPage]:
+        selection = resolve_fleet_selection(plan)
+        page = _BattlePreparationPage()
+        monkeypatch.setattr(
+            normal_fight_module,
+            'BattlePreparationPage',
+            lambda _ctx: page,
+        )
+        monkeypatch.setattr(normal_fight_module.time, 'sleep', lambda _seconds: None)
+
+        runner = NormalFightRunner(_make_ctx(), plan, selection)
+        runner._prepare_for_battle()
+        return selection, page
+
+    def test_yaml_preset_rules_reach_battle_preparation_unchanged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        plan = CombatPlan.from_dict(
+            {
+                'fleet_id': 4,
+                'fleet': ['被预设覆盖的舰船'],
+                'fleet_presets': [
+                    {
+                        'ships': [
+                            {
+                                'name': '导巡测试舰',
+                                'ship_type': ['kp'],
+                                'min_level': 90,
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+
+        selection, page = self._prepare(monkeypatch, plan)
+
+        assert selection.source is FleetSelectionSource.PLAN_PRESET
+        assert selection.slot_rules is not None
+        assert page.changed_fleet_id == 4
+        assert page.changed_rules is selection.slot_rules
+        assert page.changed_rules[0].primary == ShipSelector(
+            name='导巡测试舰',
+            ship_types=(ShipType.KP,),
+            min_level=90,
+        )
+
+    def test_plain_plan_fleet_is_converted_once_at_battle_preparation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        plan = CombatPlan.from_dict(
+            {
+                'fleet_id': 2,
+                'fleet': ['岛风', '雪风'],
+            },
+        )
+
+        selection, page = self._prepare(monkeypatch, plan)
+
+        assert selection.source is FleetSelectionSource.PLAN_FLEET
+        assert page.changed_fleet_id == 2
+        assert page.changed_rules == exact_fleet_rules(['岛风', '雪风'])
+
+    def test_real_runner_reaches_fleet_change_and_choose_ship_boundary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Runner uses the real fleet orchestration before the battle boundary."""
+        from autowsgr.ui.battle.preparation import BattlePreparationPage
+
+        ctrl = MagicMock()
+        ctrl.screenshot.return_value = np.zeros((100, 100, 3), dtype=np.uint8)
+        ctx = SimpleNamespace(
+            ctrl=ctrl,
+            config=SimpleNamespace(dock_full_destroy=False, destroy_ship_types=None),
+            ocr=MagicMock(),
+            sync_before_combat=MagicMock(),
+            sync_after_combat=MagicMock(),
+        )
+        page = BattlePreparationPage(ctx)
+        monkeypatch.setattr(normal_fight_module, 'BattlePreparationPage', lambda _ctx: page)
+
+        class FakeChooseShipPage:
+            def change_single_ship(
+                self,
+                selector: ShipSelector | None,
+                *,
+                use_search: bool,
+            ) -> str | None:
+                assert use_search is True
+                return selector.name if selector is not None else None
+
+        empty_snapshot = FleetSnapshot(
+            names=[None] * 6,
+            occupied=[False] * 6,
+        )
+        target_snapshot = FleetSnapshot(
+            names=['导巡测试舰', None, None, None, None, None],
+            occupied=[True, False, False, False, False, False],
+        )
+        snapshots = iter([empty_snapshot, target_snapshot, target_snapshot, target_snapshot])
+        monkeypatch.setattr(BattlePreparationPage, 'get_selected_fleet', lambda _self, _screen: 4)
+        monkeypatch.setattr(
+            page,
+            '_detect_initial_snapshot',
+            lambda _pool, _selectors: next(snapshots),
+        )
+        monkeypatch.setattr(page, 'detect_fleet_snapshot', lambda **_kwargs: next(snapshots))
+        monkeypatch.setattr(page, 'apply_supply', lambda: None)
+        monkeypatch.setattr(page, 'start_battle', MagicMock())
+        monkeypatch.setattr(page, '_open_choose_page', lambda _slot: FakeChooseShipPage())
+        monkeypatch.setattr(normal_fight_module.time, 'sleep', lambda _seconds: None)
+
+        plan = CombatPlan.from_dict(
+            {
+                'fleet_id': 4,
+                'fleet_presets': [{'ships': [{'name': '导巡测试舰'}]}],
+            },
+        )
+        runner = NormalFightRunner(ctx, plan, resolve_fleet_selection(plan))
+        monkeypatch.setattr(runner, '_enter_fight', lambda: None)
+        monkeypatch.setattr(runner, '_do_combat', lambda _stats: CombatResult())
+        monkeypatch.setattr(runner, '_handle_result', lambda _result: None)
+
+        runner.run()
+
+        page.start_battle.assert_called_once()
+
+
+class TestEventNormalMerge:
+    """chapter (E/H vs 数字) 决定导航分支与 plan.mode。"""
+
+    def test_event_branch_hard(self):
+        plan = CombatPlan.from_dict({'event': '20260730', 'chapter': 'H', 'map': '1a'})
+        runner = NormalFightRunner(_make_ctx(), plan, resolve_fleet_selection(plan))
+        assert runner._is_event is True
+        assert plan.mode == CombatMode.EVENT
+        assert runner._map_code == 'H1'
+        assert runner._entrance == 'alpha'
+
+    def test_event_branch_easy(self):
+        plan = CombatPlan.from_dict({'event': '20260730', 'chapter': 'E', 'map': '3b'})
+        runner = NormalFightRunner(_make_ctx(), plan, resolve_fleet_selection(plan))
+        assert runner._is_event is True
+        assert runner._map_code == 'E3'
+        assert runner._entrance == 'beta'
+
+    def test_event_no_entrance(self):
+        plan = CombatPlan.from_dict({'event': '20260212', 'chapter': 'H', 'map': 5})
+        runner = NormalFightRunner(_make_ctx(), plan, resolve_fleet_selection(plan))
+        assert runner._is_event is True
+        assert runner._entrance is None
+        assert runner._map_code == 'H5'
+
+    def test_normal_branch(self):
+        plan = CombatPlan.from_dict({'chapter': 2, 'map': 1})
+        runner = NormalFightRunner(_make_ctx(), plan, resolve_fleet_selection(plan))
+        assert runner._is_event is False
+        assert plan.mode == CombatMode.NORMAL
+        assert runner._entrance is None
+        assert runner._map_code == ''
+
+
+class TestEventFightRunnerCompat:
+    """EventFightRunner 兼容薄包装委托 NormalFightRunner。"""
+
+    def test_inherits_normal_runner(self):
+        from autowsgr.ops.event_fight import EventFightRunner
+
+        plan = CombatPlan.from_dict({'event': '20260730', 'chapter': 'H', 'map': '1a'})
+        runner = EventFightRunner(_make_ctx(), plan, resolve_fleet_selection(plan))
+        assert isinstance(runner, NormalFightRunner)
+        assert runner._is_event is True
+        assert runner._map_code == 'H1'
+
+    def test_entrance_override(self):
+        from autowsgr.ops.event_fight import EventFightRunner
+
+        plan = CombatPlan.from_dict({'event': '20260730', 'chapter': 'H', 'map': '1a'})
+        runner = EventFightRunner(
+            _make_ctx(),
+            plan,
+            resolve_fleet_selection(plan),
+            entrance='beta',
+        )
+        # override 回填 plan.entrance (alpha→'a', beta→'b')
+        assert plan.entrance == 'b'
+        assert runner._entrance == 'beta'
+
+
+class TestDockFullDialogRoute:
+    """船坞满弹窗直达解装: 点弹窗「解装」直达解体标签, 不绕主菜单导航。
+
+    正确 UI 路径 (实机): 战斗准备 → 点出征 → 船坞满弹窗 → 弹窗「解装」
+    按钮直达建造页 (返回无视 UI 栈直达主页) → 复用 destroy_ships 解装,
+    结束在主页面, 下轮 run 重新导航进图出击。
+    """
+
+    @staticmethod
+    def _make_runner(*, dock_full_destroy: bool = True) -> NormalFightRunner:
+        cfg = SimpleNamespace(dock_full_destroy=dock_full_destroy, destroy_ship_types=None)
+        ctx = SimpleNamespace(ctrl=None, config=cfg)
+        plan = CombatPlan.from_dict({'chapter': 2, 'map': 1})
+        return NormalFightRunner(ctx, plan, resolve_fleet_selection(plan))
+
+    def test_destroy_success_marks_destroyed_keeps_flag(self, monkeypatch: pytest.MonkeyPatch):
+        """解装成功 → 置 dock_full_destroyed, flag 保持 DOCK_FULL (未开打不翻成功标志)。"""
+        import autowsgr.ops.destroy as destroy_module
+
+        calls: list[bool] = []
+        monkeypatch.setattr(
+            destroy_module,
+            'destroy_ships_auto',
+            lambda _ctx, *, from_dialog: calls.append(from_dialog) or True,
+        )
+
+        runner = self._make_runner()
+        result = CombatResult(flag=ConditionFlag.DOCK_FULL)
+        runner._handle_dock_full(result)
+
+        assert calls == [True]  # 走弹窗直达路线
+        assert result.flag is ConditionFlag.DOCK_FULL  # 不翻 flag, 触发器不误计数
+        assert result.dock_full_destroyed is True
+
+    def test_destroy_exhausted_whitelist_keeps_flag(self, monkeypatch: pytest.MonkeyPatch):
+        """白名单覆盖全部舰种 → 无可解装对象 → 保持 DOCK_FULL。"""
+        import autowsgr.ops.destroy as destroy_module
+
+        monkeypatch.setattr(destroy_module, 'destroy_ships_auto', lambda _ctx, **_k: False)
+
+        runner = self._make_runner()
+        result = CombatResult(flag=ConditionFlag.DOCK_FULL)
+        runner._handle_dock_full(result)
+
+        assert result.flag is ConditionFlag.DOCK_FULL
+
+    def test_nav_error_falls_back_to_main(self, monkeypatch: pytest.MonkeyPatch):
+        """直达解装导航失败 → 回退主页面恢复已知态, 保持 DOCK_FULL。"""
+        import autowsgr.ops.destroy as destroy_module
+        from autowsgr.ui.utils import NavigationError
+
+        def _raise(_ctx: object, **_k: object) -> None:
+            raise NavigationError('弹窗直达解装失败')
+
+        monkeypatch.setattr(destroy_module, 'destroy_ships_auto', _raise)
+
+        goto_calls: list[object] = []
+        monkeypatch.setattr(
+            normal_fight_module, 'goto_page', lambda _ctx, target: goto_calls.append(target)
+        )
+
+        runner = self._make_runner()
+        result = CombatResult(flag=ConditionFlag.DOCK_FULL)
+        runner._handle_dock_full(result)
+
+        assert result.flag is ConditionFlag.DOCK_FULL
+        assert goto_calls == [PageName.MAIN]
+
+
+class TestRunForTimesDockFullBehavior:
+    """run_for_times (老旧 API, 不改): 解装成功后 flag 保持 DOCK_FULL → 提前 break。
+
+    旧版解装成功翻 SUCCESS 会继续下一轮; 根治计数污染后 flag 不翻,
+    循环保守停止, 由上层/用户决策再启动。
+    """
+
+    def test_destroyed_dock_full_stops_loop(self, monkeypatch: pytest.MonkeyPatch):
+        runner = TestDockFullDialogRoute._make_runner()
+
+        resolved = CombatResult(flag=ConditionFlag.DOCK_FULL, dock_full_destroyed=True)
+        calls: list[int] = []
+        monkeypatch.setattr(runner, 'run', lambda **_k: calls.append(1) or resolved)
+
+        results = runner.run_for_times(3)
+
+        assert len(calls) == 1  # DOCK_FULL 即 break, 不再继续
+        assert results == [resolved]
+
+
+class TestSkipCheckLifecycle:
+    """skip_check 仅在成功完成一场战斗 (OPERATION_SUCCESS) 后置位。
+
+    背景 (实机 2026-08-16 日志): 解装轮 (DOCK_FULL, 战斗未开打, 解装后停在
+    主页面) 也被无条件置 True, 下一轮带着"活动页浮层态在"的错误假设直接
+    出击 → 按钮匹配不到 → 回退固定坐标盲点误触节点卡片按出浮层 → 超时。
+    中途打断/失败一律恢复完整检查。
+
+    2026-10-11 起标记持久化到 :attr:`GameContext.overlay_ready_maps`
+    (键控关卡身份): 触发器模式每轮经 factory 新建 runner, 实例属性会随轮归零,
+    弹层复用从未生效 (实机日志每轮"已关闭残留关卡浮层")。
+
+    此前挂在 ``NormalFightRunner._overlay_ready`` 类变量上, 但类变量是进程级的
+    (同进程跑不同计划会共享、重启即丢、永不清理); ctx 在触发器模式下跨轮存活,
+    生命周期恰好匹配。
+    """
+
+    @pytest.fixture
+    def _ctx(self) -> SimpleNamespace:
+        """供各用例复用的 ctx (含弹层复用集合)。"""
+        cfg = SimpleNamespace(dock_full_destroy=False, destroy_ship_types=None)
+        return SimpleNamespace(
+            ctrl=None,
+            config=cfg,
+            sync_before_combat=MagicMock(),
+            sync_after_combat=MagicMock(),
+            overlay_ready_maps=set(),
+        )
+
+    @staticmethod
+    def _make_runner(ctx=None) -> NormalFightRunner:
+        if ctx is None:
+            cfg = SimpleNamespace(dock_full_destroy=False, destroy_ship_types=None)
+            ctx = SimpleNamespace(
+                ctrl=None,
+                config=cfg,
+                sync_before_combat=MagicMock(),
+                sync_after_combat=MagicMock(),
+                overlay_ready_maps=set(),
+            )
+        plan = CombatPlan.from_dict({'chapter': 'H', 'map': 5})
+        return NormalFightRunner(ctx, plan, resolve_fleet_selection(plan))
+
+    def _mock_flow(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        runner: NormalFightRunner,
+        flag: ConditionFlag,
+    ) -> None:
+        """mock run() 流程各环节, _do_combat 返回指定 flag 的结果。"""
+        monkeypatch.setattr(runner, '_enter_fight', lambda: None)
+        monkeypatch.setattr(runner, '_prepare_for_battle', list)
+        monkeypatch.setattr(runner, '_do_combat', lambda _stats: CombatResult(flag=flag))
+        monkeypatch.setattr(runner, '_handle_result', lambda _result: None)
+        monkeypatch.setattr(normal_fight_module.time, 'sleep', lambda _seconds: None)
+
+    def test_first_run_starts_with_full_check(self):
+        """新 runner 从完整检查开始 (init 回归, 防语义漂移)。"""
+        assert self._make_runner()._skip_check is False
+
+    def test_success_sets_skip_check(self, monkeypatch: pytest.MonkeyPatch):
+        """成功完成一场战斗 (战后回港必落关卡浮层态) → 下一轮可跳过检查。"""
+        runner = self._make_runner()
+        self._mock_flow(monkeypatch, runner, ConditionFlag.OPERATION_SUCCESS)
+
+        runner.run()
+
+        assert runner._skip_check is True
+
+    def test_dock_full_resets_skip_check(self, monkeypatch: pytest.MonkeyPatch):
+        """解装轮 (DOCK_FULL, 战斗未开打) → 浮层态前提破坏, 恢复完整检查。"""
+        runner = self._make_runner()
+        runner._skip_check = True  # 模拟上一轮成功
+        self._mock_flow(monkeypatch, runner, ConditionFlag.DOCK_FULL)
+
+        runner.run()
+
+        assert runner._skip_check is False
+
+    def test_mid_fight_error_resets_skip_check(self, monkeypatch: pytest.MonkeyPatch):
+        """中途异常 (导航超时等) → 下一轮恢复完整检查 (实机 log 场景回归)。"""
+        from autowsgr.ui.utils import NavigationError
+
+        runner = self._make_runner()
+        runner._skip_check = True  # 模拟上一轮成功
+
+        def _raise_nav_error() -> None:
+            raise NavigationError('等待超时: EVENT_MAP -> BATTLE_PREP')
+
+        monkeypatch.setattr(runner, '_enter_fight', _raise_nav_error)
+
+        with pytest.raises(NavigationError):
+            runner.run()
+
+        assert runner._skip_check is False
+
+    def test_skip_check_survives_new_runner_instance(
+        self, monkeypatch: pytest.MonkeyPatch, _ctx,
+    ):
+        """成功标记跨实例可见: 触发器模式每轮新建 runner, 下一轮可直接复用弹层。
+
+        关键: 两个 runner 必须共享**同一个 ctx** —— 这正是
+        ``scheduler/triggers.py`` 里 ``plan.factory(ctx)`` 的真实行为,
+        也是「状态放ctx 而非类变量」成立的前提。
+        """
+        runner = self._make_runner(_ctx)
+        self._mock_flow(monkeypatch, runner, ConditionFlag.OPERATION_SUCCESS)
+        runner.run()
+
+        fresh = self._make_runner(_ctx)  # 模拟触发器 factory 下一轮新建
+
+        assert fresh._skip_check is True
+
+    def test_failure_not_visible_to_new_runner(
+        self, monkeypatch: pytest.MonkeyPatch, _ctx,
+    ):
+        """失败撤销标记: 新实例仍从完整检查开始。"""
+        runner = self._make_runner(_ctx)
+        self._mock_flow(monkeypatch, runner, ConditionFlag.OPERATION_SUCCESS)
+        runner.run()
+
+        runner2 = self._make_runner(_ctx)
+        self._mock_flow(monkeypatch, runner2, ConditionFlag.SL)
+        runner2.run()
+
+        fresh = self._make_runner(_ctx)
+
+        assert fresh._skip_check is False
+
+    def test_different_ctx_does_not_share_state(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """不同 ctx 之间互不影响 (类变量方案的最大问题之一)。
+
+        同一进程跑两套计划 (如挂机 A + 手动跑 B) 时, ctx 级状态天然隔离。
+        """
+        ctx_a = self._make_runner()._ctx
+        ctx_b = self._make_runner()._ctx
+        assert ctx_a is not ctx_b
+
+        runner_a = self._make_runner(ctx_a)
+        self._mock_flow(monkeypatch, runner_a, ConditionFlag.OPERATION_SUCCESS)
+        runner_a.run()
+
+        # ctx_b 没见过成功, 应从完整检查开始
+        runner_b = self._make_runner(ctx_b)
+        assert runner_b._skip_check is False
+
+
+class TestEnterEventFastPaths:
+    """弹层循环模式三级路径 (2026-10-09 用户方案):
+
+    1. 已在出征准备页 → 零点击直接开始;
+    2. 关卡详情弹层在屏 → 仅点一次「出击准备」;
+    3. 其他页面 → 完整导航选关兜底。
+    """
+
+    @staticmethod
+    def _make_runner(skip_check: bool = False) -> NormalFightRunner:
+        runner = TestSkipCheckLifecycle._make_runner()
+        runner._skip_check = skip_check
+        runner._ctrl = MagicMock()
+        return runner
+
+    def _run_enter_event(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        runner: NormalFightRunner,
+        *,
+        prep_page: bool,
+        overlay: bool,
+    ) -> dict[str, Any]:
+        import autowsgr.ui.battle.preparation as prep_mod
+
+        calls: dict[str, Any] = {'goto': 0, 'start_fight': [], 'page_built': 0}
+        page = MagicMock()
+        page.is_fight_ready.return_value = overlay
+        page.start_fight.side_effect = (
+            lambda *a, **k: calls['start_fight'].append(
+                k.get('skip_check', a[2] if len(a) > 2 else None)
+            )
+        )
+        fake_page_cls = MagicMock(
+            side_effect=lambda *a, **k: (calls.__setitem__('page_built', calls['page_built'] + 1), page)[1]
+        )
+        monkeypatch.setattr(normal_fight_module, 'BaseEventPage', fake_page_cls)
+        monkeypatch.setattr(
+            normal_fight_module,
+            'goto_page',
+            lambda *a, **k: calls.__setitem__('goto', calls['goto'] + 1),
+        )
+        page_match = SimpleNamespace(matched=prep_page)
+        monkeypatch.setattr(
+            prep_mod.BattlePreparationPage,
+            'is_current_page',
+            staticmethod(lambda s: page_match),
+        )
+
+        runner._enter_event()
+        return calls
+
+    def test_prep_page_direct_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """已在准备页 → 零点击零导航, 直接开始本轮。"""
+        runner = self._make_runner()
+        calls = self._run_enter_event(monkeypatch, runner, prep_page=True, overlay=False)
+        assert calls['goto'] == 0
+        assert calls['page_built'] == 0
+        assert calls['start_fight'] == []
+
+    def test_overlay_clicks_fight_button(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """弹层在屏 → 仅构造页面并点「出击准备」(skip_check=True 跳选关)。"""
+        runner = self._make_runner()
+        calls = self._run_enter_event(monkeypatch, runner, prep_page=False, overlay=True)
+        assert calls['goto'] == 0
+        assert calls['page_built'] == 1
+        assert calls['start_fight'] == [True]
+
+    def test_full_navigation_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """其他页面 (首次/SL 后) → 完整导航, skip_check 透传。"""
+        runner = self._make_runner(skip_check=False)
+        calls = self._run_enter_event(monkeypatch, runner, prep_page=False, overlay=False)
+        assert calls['goto'] == 1
+        assert calls['page_built'] == 2  # 弹层检测 + 导航后各构造一次
+        assert calls['start_fight'] == [False]
